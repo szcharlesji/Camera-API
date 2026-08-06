@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# macOS
+.DS_Store
+
+# Captured media pulled off the device
+*.mov
+*.mp4
+*.jpg

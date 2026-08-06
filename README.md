@@ -67,6 +67,22 @@ idevicepair pair
 iproxy 8080:8080
 ```
 
+**No `iproxy`, or no root to install it?** You don't need it. `usbmuxd` listens
+on a world-writable socket, and [`client/usbmux.py`](client/usbmux.py) speaks the
+protocol in pure Python — so the client can tunnel straight to the device with
+nothing installed:
+
+```bash
+./client/camctl --usbmux status
+```
+
+Tools that need a real TCP port (ffmpeg, VLC, OpenCV) get one from the built-in
+forwarder, a drop-in `iproxy` replacement:
+
+```bash
+./client/camctl tunnel 8080:8080
+```
+
 ### 4. Drive it
 
 ```bash
@@ -194,6 +210,7 @@ Camera API/
   Server/       HTTP/1.1 server on NWListener, routing, MJPEG and SSE broadcasters
 client/
   camera_api.py Python client library (stdlib only)
+  usbmux.py     usbmux protocol in pure Python — replaces iproxy, needs no root
   camctl        Command line interface
   examples/     Runnable examples
 docs/

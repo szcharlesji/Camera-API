@@ -31,6 +31,14 @@ Non-2xx responses carry:
 | `internal_error` | 500 | Asset writer or capture failure. The message carries the underlying reason. |
 | `unavailable` | 503 | No camera, or the session is not running. |
 
+### Nullable fields
+
+Fields documented as nullable are **always present**, carrying `null` when empty:
+`session.lastError`, `session.interruptionReason`, `status.recording`,
+`device.batteryLevel`, `device.freeDiskBytes`, `storage.freeDiskBytes`,
+`recording.maxDurationSeconds`. A client can index them without checking whether
+the key exists.
+
 ### Authentication
 
 When a token is configured, send it on every request except `/health`:
@@ -246,18 +254,87 @@ Applies any subset of the manual controls. Ranges are validated against the
 
 | Group | `mode` | Extra fields |
 |---|---|---|
-| `focus` | `auto`, `locked`, `manual` | `lensPosition` 0.0 (near) – 1.0 (far), required for `manual`. `pointOfInterest` `[x, y]` in 0–1 |
-| `exposure` | `auto`, `locked`, `manual` | `durationSeconds` (shutter), `iso`, both clamped to the active format. `targetBias` is EV compensation in `auto` |
-| `whiteBalance` | `auto`, `locked`, `manual` | `temperature` in Kelvin, `tint` −150…150 |
+| `focus` | `auto`, `single`, `locked`, `manual` | `lensPosition` 0.0 (near) – 1.0 (far), required for `manual`. `pointOfInterest` `[x, y]` in 0–1 |
+| `exposure` | `auto`, `single`, `locked`, `manual` | `durationSeconds` (shutter), `iso`, both clamped to the active format. `targetBias` is EV compensation in `auto` |
+| `whiteBalance` | `auto`, `single`, `locked`, `manual` | `temperature` in Kelvin, `tint` −150…150 |
 | `zoom` | — | Between the camera's `minZoom` and `maxZoom` |
 | `torch` | — | `on`, and `level` 0.0–1.0 |
 
-Returns the resulting control state.
+Returns the resulting control state, **after the hardware has settled**. Focus,
+custom exposure, exposure bias and locked white balance all take physical time —
+the lens has to travel — so the request blocks on AVFoundation's completion
+handler (2 s cap) before reading state back. A client can therefore trust that
+
+```python
+cam.control(focus={"mode": "manual", "lensPosition": 0.6})["lensPosition"]
+```
+
+reflects where the lens actually is. Measured travel is under 0.3 s across the
+full range.
 
 > For repeatable capture, lock all three of focus, exposure and white balance
 > before the first take. Otherwise the camera re-meters between takes and your
 > footage will not match. `camctl lock` and `CameraAPI.lock_everything()` do this
 > in one call.
+
+#### How focus behaves
+
+The session starts in **continuous autofocus** — the camera keeps refocusing on
+its own, which is wrong for a fixed rig: it will hunt mid-recording and your
+footage changes sharpness. Three modes:
+
+| `mode` | Behaviour |
+|---|---|
+| `auto` | Continuous autofocus. The default. Add `pointOfInterest` to steer what it meters on. |
+| `single` | **AF-S.** Sweeps once, then holds. Nothing re-focuses afterwards. |
+| `locked` | Freezes the lens wherever it currently is, with no sweep first. |
+| `manual` | Drives the lens to an explicit `lensPosition`, `0.0` (near) to `1.0` (far). Fully repeatable across runs and reboots. |
+
+**`single` is the one you usually want for a rig.** It is the "focus once, then
+stop touching it" behaviour of a normal camera: AVFoundation runs one focus
+sweep and then moves the mode to `locked` itself, so every subsequent recording
+keeps exactly the same focus. The request blocks until the sweep finishes
+(3 s cap), so the `lensPosition` you get back is the settled one.
+
+```bash
+camctl control --focus single
+```
+
+```python
+cam.focus_once()                 # or cam.focus_once(point=[0.5, 0.5])
+```
+
+`exposure` and `whiteBalance` accept `single` too, with the same meaning — meter
+once, then hold. To converge all three and lock them in one call:
+
+```bash
+camctl lock --converge
+```
+
+```python
+cam.lock_everything(converge=True)
+```
+
+Plain `camctl lock` still freezes all three immediately without a sweep, which is
+faster but pins whatever the camera happened to be doing — including a blurry
+frame if it had not settled. `--converge` is the safer default for a new setup.
+
+`lensPosition` is a normalised lens-travel figure, not a distance in metres — the
+mapping to real distance is camera-specific, so find your working value by
+experiment. Sweeping it and measuring image sharpness works well; on the test
+device sharpness varied **30×** between the best and worst position, with a clear
+single peak:
+
+```python
+for target in [i / 10 for i in range(11)]:
+    cam.control(focus={"mode": "manual", "lensPosition": target})
+    jpeg = cam.snapshot(max_width=640, quality=0.9)
+    # variance of the Laplacian, or simply len(jpeg) as a cheap proxy —
+    # a blurrier frame compresses smaller at fixed quality
+```
+
+Once you know the value, pin it at the start of every session and the rig is
+deterministic.
 
 ### `POST /stream/settings`
 

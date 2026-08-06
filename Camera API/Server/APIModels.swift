@@ -95,6 +95,31 @@ struct ServerSettingsRequest: Decodable {
 
 // MARK: - Responses
 
+/// Encodes `nil` as an explicit JSON `null` rather than dropping the key.
+///
+/// Swift's synthesised `Encodable` uses `encodeIfPresent` for optional
+/// properties, so a nil field vanishes from the payload entirely. For a
+/// machine-facing API a stable key set is worth far more than the handful of
+/// bytes saved: a client can write `status["recording"]` without first checking
+/// whether the key exists. Response DTOs wrap their optionals in this.
+@propertyWrapper
+struct Nullable<Wrapped: Encodable>: Encodable {
+    var wrappedValue: Wrapped?
+
+    init(wrappedValue: Wrapped?) {
+        self.wrappedValue = wrappedValue
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let wrappedValue {
+            try container.encode(wrappedValue)
+        } else {
+            try container.encodeNil()
+        }
+    }
+}
+
 struct APIInfoDTO: Encodable {
     let name: String
     let version: String
@@ -113,10 +138,10 @@ struct DeviceInfoDTO: Encodable {
     let systemName: String
     let systemVersion: String
     let thermalState: String
-    let batteryLevel: Double?
+    @Nullable var batteryLevel: Double?
     let batteryState: String
     let lowPowerModeEnabled: Bool
-    let freeDiskBytes: Int64?
+    @Nullable var freeDiskBytes: Int64?
 }
 
 struct CameraDescriptorDTO: Encodable {
@@ -167,11 +192,11 @@ struct SessionConfigDTO: Encodable {
 struct SessionStateDTO: Encodable {
     let running: Bool
     let interrupted: Bool
-    let interruptionReason: String?
+    @Nullable var interruptionReason: String?
     let cameraPermission: String
     let microphonePermission: String
     let config: SessionConfigDTO
-    let lastError: String?
+    @Nullable var lastError: String?
 }
 
 struct ControlStateDTO: Encodable {
@@ -197,7 +222,7 @@ struct ActiveRecordingDTO: Encodable {
     let framesWritten: Int
     let framesDropped: Int
     let bytesWritten: Int64
-    let maxDurationSeconds: Double?
+    @Nullable var maxDurationSeconds: Double?
 }
 
 struct StreamStateDTO: Encodable {
@@ -210,7 +235,7 @@ struct StreamStateDTO: Encodable {
 struct StorageDTO: Encodable {
     let recordingCount: Int
     let totalBytes: Int64
-    let freeDiskBytes: Int64?
+    @Nullable var freeDiskBytes: Int64?
 }
 
 struct StatusResponseDTO: Encodable {
@@ -218,7 +243,7 @@ struct StatusResponseDTO: Encodable {
     let device: DeviceInfoDTO
     let session: SessionStateDTO
     let controls: ControlStateDTO
-    let recording: ActiveRecordingDTO?
+    @Nullable var recording: ActiveRecordingDTO?
     let stream: StreamStateDTO
     let storage: StorageDTO
 }
@@ -322,7 +347,7 @@ struct RecordingDTO: Encodable, Decodable {
 struct RecordingListDTO: Encodable {
     let recordings: [RecordingDTO]
     let totalBytes: Int64
-    let freeDiskBytes: Int64?
+    @Nullable var freeDiskBytes: Int64?
 }
 
 struct DeleteResultDTO: Encodable {
@@ -332,7 +357,7 @@ struct DeleteResultDTO: Encodable {
 
 struct AcknowledgementDTO: Encodable {
     let ok: Bool
-    var message: String?
+    @Nullable var message: String?
 }
 
 // MARK: - Events

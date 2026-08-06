@@ -109,6 +109,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
     private var activeRecording: ActiveRecording?
     private var pendingSnapshots: [SnapshotRequest] = []
     private var lastStreamedFrameTime: CFTimeInterval = 0
+    private var lastProgressPublish: CFTimeInterval = 0
 
     // MARK: - Shared state (stateLock)
 
@@ -667,43 +668,103 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
     // MARK: - Controls
 
+    /// A change whose effect lands asynchronously — the lens has to physically
+    /// travel, the exposure ramp has to run.
+    ///
+    /// The AVFoundation call itself is always made *inside* `lockForConfiguration`
+    /// (calling it unlocked throws `NSGenericException`); only the waiting happens
+    /// after the lock is released, so `POST /control` can report state that has
+    /// actually taken effect without pinning the device lock while it blocks.
+    private enum PendingSettle {
+        /// A call that reports completion through a handler.
+        case handler(label: String, semaphore: DispatchSemaphore)
+        /// A one-shot scan. `.autoFocus`, `.autoExpose` and `.autoWhiteBalance`
+        /// have no completion handler; the only signal is the device's
+        /// `isAdjusting…` flag dropping back to false.
+        case scan(label: String, isAdjusting: () -> Bool)
+    }
+
     func applyControls(_ request: ControlRequest) throws -> ControlStateDTO {
         guard let device = videoDevice else {
             throw APIError.unavailable("No camera configured.")
         }
+
+        var pending: [PendingSettle] = []
 
         do {
             try device.lockForConfiguration()
         } catch {
             throw APIError.internalError("Could not lock camera: \(error.localizedDescription)")
         }
-        defer { device.unlockForConfiguration() }
 
-        if let focus = request.focus {
-            try applyFocus(focus, to: device)
-        }
-        if let exposure = request.exposure {
-            try applyExposure(exposure, to: device)
-        }
-        if let whiteBalance = request.whiteBalance {
-            try applyWhiteBalance(whiteBalance, to: device)
-        }
-        if let zoom = request.zoom {
-            let lower = device.minAvailableVideoZoomFactor
-            let upper = device.maxAvailableVideoZoomFactor
-            guard zoom >= lower, zoom <= upper else {
-                throw APIError.badRequest("zoom must be between \(lower) and \(upper) for this camera and format.")
+        do {
+            if let focus = request.focus {
+                try applyFocus(focus, to: device, pending: &pending)
             }
-            device.videoZoomFactor = CGFloat(zoom)
+            if let exposure = request.exposure {
+                try applyExposure(exposure, to: device, pending: &pending)
+            }
+            if let whiteBalance = request.whiteBalance {
+                try applyWhiteBalance(whiteBalance, to: device, pending: &pending)
+            }
+            if let zoom = request.zoom {
+                let lower = device.minAvailableVideoZoomFactor
+                let upper = device.maxAvailableVideoZoomFactor
+                guard zoom >= lower, zoom <= upper else {
+                    throw APIError.badRequest("zoom must be between \(lower) and \(upper) for this camera and format.")
+                }
+                device.videoZoomFactor = CGFloat(zoom)
+            }
+            if let torch = request.torch {
+                try applyTorch(torch, to: device)
+            }
+        } catch {
+            device.unlockForConfiguration()
+            throw error
         }
-        if let torch = request.torch {
-            try applyTorch(torch, to: device)
-        }
+
+        // Every mutating call has now been made under the lock. Release it before
+        // blocking: the scans take up to seconds, and the capture pipeline needs
+        // the device back.
+        device.unlockForConfiguration()
+
+        for settle in pending { awaitSettle(settle) }
 
         return controlState()
     }
 
-    private func applyFocus(_ focus: ControlRequest.Focus, to device: AVCaptureDevice) throws {
+    /// Blocks until a device change lands. A timeout only logs: the hardware may
+    /// legitimately still be ramping, and reporting slightly-early state beats
+    /// failing a request that did take effect.
+    private func awaitSettle(_ settle: PendingSettle, timeout: TimeInterval = 3.0) {
+        switch settle {
+        case .handler(let label, let semaphore):
+            if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+                log.notice("\(label, privacy: .public) did not settle within \(timeout, privacy: .public)s")
+            }
+
+        case .scan(let label, let isAdjusting):
+            let start = Date()
+            // The scan does not raise the flag instantly, so wait briefly for it
+            // to begin before watching for it to end — otherwise a fast check
+            // sees "not adjusting" and returns before the sweep even starts.
+            while !isAdjusting(), Date().timeIntervalSince(start) < 0.25 {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            while isAdjusting(), Date().timeIntervalSince(start) < timeout {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            if isAdjusting() {
+                log.notice("\(label, privacy: .public) still scanning after \(timeout, privacy: .public)s")
+            }
+        }
+    }
+
+    private func applyFocus(
+        _ focus: ControlRequest.Focus,
+        to device: AVCaptureDevice,
+        pending: inout [PendingSettle]
+    ) throws {
         if let point = focus.pointOfInterest {
             guard point.count == 2, (0...1).contains(point[0]), (0...1).contains(point[1]) else {
                 throw APIError.badRequest("focus.pointOfInterest must be [x, y] with both in 0...1.")
@@ -721,6 +782,15 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 throw APIError.badRequest("This camera does not support continuous autofocus.")
             }
             device.focusMode = .continuousAutoFocus
+        case "single", "once", "auto_once":
+            // AF-S: sweep once, then AVFoundation moves the mode to .locked by
+            // itself. Waiting for the sweep is what makes this useful — the caller
+            // gets back a settled lens position and nothing re-focuses afterwards.
+            guard device.isFocusModeSupported(.autoFocus) else {
+                throw APIError.badRequest("This camera does not support single-shot autofocus.")
+            }
+            device.focusMode = .autoFocus
+            pending.append(.scan(label: "single-shot focus", isAdjusting: { device.isAdjustingFocus }))
         case "locked":
             guard device.isFocusModeSupported(.locked) else {
                 throw APIError.badRequest("This camera does not support locked focus.")
@@ -730,16 +800,25 @@ final class CaptureController: NSObject, @unchecked Sendable {
             guard device.isLockingFocusWithCustomLensPositionSupported else {
                 throw APIError.badRequest("This camera does not support manual lens position.")
             }
-            guard let position = focus.lensPosition, (0...1).contains(position) else {
-                throw APIError.badRequest("focus.lensPosition is required for manual focus and must be in 0...1.")
+            guard let position = focus.lensPosition else {
+                throw APIError.badRequest("focus.lensPosition is required when focus.mode is 'manual'.")
             }
-            device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+            guard (0...1).contains(position) else {
+                throw APIError.badRequest("focus.lensPosition must be in 0...1 (0 = near, 1 = far); got \(position).")
+            }
+            let semaphore = DispatchSemaphore(value: 0)
+            device.setFocusModeLocked(lensPosition: position) { _ in semaphore.signal() }
+            pending.append(.handler(label: "focus lens position", semaphore: semaphore))
         default:
-            throw APIError.badRequest("Unknown focus.mode '\(mode)'. Expected 'auto', 'locked' or 'manual'.")
+            throw APIError.badRequest("Unknown focus.mode '\(mode)'. Expected 'auto', 'single', 'locked' or 'manual'.")
         }
     }
 
-    private func applyExposure(_ exposure: ControlRequest.Exposure, to device: AVCaptureDevice) throws {
+    private func applyExposure(
+        _ exposure: ControlRequest.Exposure,
+        to device: AVCaptureDevice,
+        pending: inout [PendingSettle]
+    ) throws {
         if let point = exposure.pointOfInterest {
             guard point.count == 2, (0...1).contains(point[0]), (0...1).contains(point[1]) else {
                 throw APIError.badRequest("exposure.pointOfInterest must be [x, y] with both in 0...1.")
@@ -756,7 +835,9 @@ final class CaptureController: NSObject, @unchecked Sendable {
             guard bias >= lower, bias <= upper else {
                 throw APIError.badRequest("exposure.targetBias must be between \(lower) and \(upper).")
             }
-            device.setExposureTargetBias(bias, completionHandler: nil)
+            let semaphore = DispatchSemaphore(value: 0)
+            device.setExposureTargetBias(bias) { _ in semaphore.signal() }
+            pending.append(.handler(label: "exposure target bias", semaphore: semaphore))
         }
 
         guard let mode = exposure.mode?.lowercased() else { return }
@@ -766,6 +847,13 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 throw APIError.badRequest("This camera does not support continuous auto exposure.")
             }
             device.exposureMode = .continuousAutoExposure
+        case "single", "once", "auto_once":
+            // Meter once, then AVFoundation locks it. The exposure equivalent of AF-S.
+            guard device.isExposureModeSupported(.autoExpose) else {
+                throw APIError.badRequest("This camera does not support single-shot auto exposure.")
+            }
+            device.exposureMode = .autoExpose
+            pending.append(.scan(label: "single-shot exposure", isAdjusting: { device.isAdjustingExposure }))
         case "locked":
             guard device.isExposureModeSupported(.locked) else {
                 throw APIError.badRequest("This camera does not support locked exposure.")
@@ -799,13 +887,19 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 iso = AVCaptureDevice.currentISO
             }
 
-            device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
+            let semaphore = DispatchSemaphore(value: 0)
+            device.setExposureModeCustom(duration: duration, iso: iso) { _ in semaphore.signal() }
+            pending.append(.handler(label: "custom exposure", semaphore: semaphore))
         default:
-            throw APIError.badRequest("Unknown exposure.mode '\(mode)'. Expected 'auto', 'locked' or 'manual'.")
+            throw APIError.badRequest("Unknown exposure.mode '\(mode)'. Expected 'auto', 'single', 'locked' or 'manual'.")
         }
     }
 
-    private func applyWhiteBalance(_ whiteBalance: ControlRequest.WhiteBalance, to device: AVCaptureDevice) throws {
+    private func applyWhiteBalance(
+        _ whiteBalance: ControlRequest.WhiteBalance,
+        to device: AVCaptureDevice,
+        pending: inout [PendingSettle]
+    ) throws {
         guard let mode = whiteBalance.mode?.lowercased() else { return }
         switch mode {
         case "auto", "continuous":
@@ -813,6 +907,12 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 throw APIError.badRequest("This camera does not support continuous auto white balance.")
             }
             device.whiteBalanceMode = .continuousAutoWhiteBalance
+        case "single", "once", "auto_once":
+            guard device.isWhiteBalanceModeSupported(.autoWhiteBalance) else {
+                throw APIError.badRequest("This camera does not support single-shot auto white balance.")
+            }
+            device.whiteBalanceMode = .autoWhiteBalance
+            pending.append(.scan(label: "single-shot white balance", isAdjusting: { device.isAdjustingWhiteBalance }))
         case "locked":
             guard device.isWhiteBalanceModeSupported(.locked) else {
                 throw APIError.badRequest("This camera does not support locked white balance.")
@@ -833,9 +933,11 @@ final class CaptureController: NSObject, @unchecked Sendable {
             gains.redGain = min(max(gains.redGain, 1.0), maxGain)
             gains.greenGain = min(max(gains.greenGain, 1.0), maxGain)
             gains.blueGain = min(max(gains.blueGain, 1.0), maxGain)
-            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            let semaphore = DispatchSemaphore(value: 0)
+            device.setWhiteBalanceModeLocked(with: gains) { _ in semaphore.signal() }
+            pending.append(.handler(label: "white balance gains", semaphore: semaphore))
         default:
-            throw APIError.badRequest("Unknown whiteBalance.mode '\(mode)'. Expected 'auto', 'locked' or 'manual'.")
+            throw APIError.badRequest("Unknown whiteBalance.mode '\(mode)'. Expected 'auto', 'single', 'locked' or 'manual'.")
         }
     }
 
@@ -1147,8 +1249,11 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         if recording.videoInput.append(sampleBuffer) {
             recording.framesWritten += 1
             recording.lastPTS = presentationTime
-            // Refreshing the file size every frame would stat() at capture rate.
-            if recording.framesWritten % 30 == 0 {
+            // Publishing costs a stat(), so it is paced by wall clock rather than
+            // frame count — at 240 fps a per-N-frames rule would fire 8x a second.
+            let now = CACurrentMediaTime()
+            if now - lastProgressPublish >= 0.5 {
+                lastProgressPublish = now
                 publishProgress(for: recording)
             }
         } else {

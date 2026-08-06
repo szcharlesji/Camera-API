@@ -80,11 +80,37 @@ class CameraAPI:
         port: int = DEFAULT_PORT,
         token: Optional[str] = None,
         timeout: float = 30.0,
+        usbmux: bool = False,
+        udid: Optional[str] = None,
     ):
+        """
+        By default this talks plain TCP to ``host:port``, which is what an
+        ``iproxy`` tunnel gives you.
+
+        With ``usbmux=True`` it speaks the usbmux protocol to the local daemon
+        instead, tunnelling straight to ``port`` *inside the device*. That needs
+        no ``iproxy`` binary and no root — useful on machines where you cannot
+        install ``libusbmuxd-tools``. ``udid`` picks a device when more than one
+        is attached.
+        """
         self.host = host
         self.port = port
         self.token = token or os.environ.get("CAMERA_API_TOKEN") or None
         self.timeout = timeout
+        self.usbmux = usbmux or os.environ.get("CAMERA_API_USBMUX") in ("1", "true", "yes")
+        self.udid = udid or os.environ.get("CAMERA_API_UDID") or None
+
+        if self.usbmux:
+            from usbmux import UsbmuxError, UsbmuxHTTPHandler
+
+            self._opener = urllib.request.build_opener(UsbmuxHTTPHandler(udid=self.udid))
+            # usbmux failures surface from inside urllib's handler chain. They are
+            # RuntimeErrors, not OSErrors, so urllib does not wrap them in URLError
+            # and they would otherwise reach the caller as a raw traceback.
+            self._transport_errors: tuple = (UsbmuxError,)
+        else:
+            self._opener = urllib.request.build_opener()
+            self._transport_errors = ()
 
     # ------------------------------------------------------------------ plumbing
 
@@ -128,18 +154,31 @@ class CameraAPI:
             self._url(path, params), data=data, headers=headers, method=method
         )
         try:
-            return urllib.request.urlopen(
+            return self._opener.open(
                 request, timeout=self.timeout if timeout is None else timeout
             )
         except urllib.error.HTTPError as exc:
             raise self._to_error(exc) from None
+        except self._transport_errors as exc:
+            raise CameraAPIError(str(exc)) from None
         except urllib.error.URLError as exc:
-            raise CameraAPIError(
-                f"Could not reach {self.base_url}: {exc.reason}. "
-                f"Is the app in the foreground and 'iproxy {self.port}:{self.port}' running?"
-            ) from None
+            raise CameraAPIError(f"Could not reach {self.base_url}: {exc.reason}. {self._hint()}") from None
         except socket.timeout:
             raise CameraAPIError(f"Request to {path} timed out after {timeout or self.timeout}s") from None
+
+    def _hint(self) -> str:
+        """Names the most likely cause of a connection failure."""
+        if self.usbmux:
+            return "Is the app installed and in the foreground?"
+        # A live usbmuxd socket with no tunnel is the common case on hosts where
+        # libusbmuxd-tools was never installed.
+        if os.path.exists("/var/run/usbmuxd") or os.path.exists("/run/usbmuxd"):
+            return (
+                f"No listener on {self.host}:{self.port}, but usbmuxd is running. "
+                f"Either start 'iproxy {self.port}:{self.port}', or skip it entirely "
+                f"with CameraAPI(usbmux=True) / camctl --usbmux."
+            )
+        return f"Is the app in the foreground and 'iproxy {self.port}:{self.port}' running?"
 
     @staticmethod
     def _to_error(exc: urllib.error.HTTPError) -> CameraAPIError:
@@ -266,16 +305,34 @@ class CameraAPI:
         }
         return self._json("POST", "/control", body={k: v for k, v in body.items() if v is not None})
 
-    def lock_everything(self) -> dict:
-        """Locks focus, exposure and white balance at their current values.
+    def focus_once(self, point: Optional[list] = None) -> dict:
+        """Single-shot autofocus — the AF-S of a normal camera.
 
-        The usual first step for repeatable capture: it stops the camera
-        re-metering between takes.
+        Sweeps the lens once, then holds it. Nothing re-focuses afterwards, so
+        every subsequent recording keeps the same focus. This call does not
+        return until the sweep has finished, so the ``lensPosition`` in the
+        result is where the lens actually ended up.
+
+        ``point`` optionally steers what it focuses on, as ``[x, y]`` in 0...1.
         """
+        focus: dict = {"mode": "single"}
+        if point is not None:
+            focus["pointOfInterest"] = point
+        return self.control(focus=focus)
+
+    def lock_everything(self, converge: bool = False) -> dict:
+        """Stops focus, exposure and white balance drifting between takes.
+
+        By default this freezes all three exactly where they currently are.
+        With ``converge=True`` each one runs a single-shot pass first and locks
+        on that result — safer when the camera has not settled yet, since
+        freezing immediately can pin a blurry or badly-metered frame.
+        """
+        mode = "single" if converge else "locked"
         return self.control(
-            focus={"mode": "locked"},
-            exposure={"mode": "locked"},
-            white_balance={"mode": "locked"},
+            focus={"mode": mode},
+            exposure={"mode": mode},
+            white_balance={"mode": mode},
         )
 
     def set_stream_settings(
@@ -352,7 +409,7 @@ class CameraAPI:
 
     def storage(self) -> dict:
         result = self._json("GET", "/files")
-        return {"totalBytes": result["totalBytes"], "freeDiskBytes": result["freeDiskBytes"]}
+        return {"totalBytes": result.get("totalBytes", 0), "freeDiskBytes": result.get("freeDiskBytes")}
 
     def get_recording(self, recording_id: str) -> dict:
         return self._json("GET", f"/files/{recording_id}")

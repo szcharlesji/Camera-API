@@ -63,6 +63,40 @@ def progress_bar(done: int, total: int):
 # -------------------------------------------------------------------- commands
 
 
+def cmd_devices(cam, args):
+    import usbmux
+
+    devices = usbmux.list_devices()
+    if emit(devices, args.json):
+        return
+    if not devices:
+        print("No iOS devices attached.")
+        return
+    for device in devices:
+        print(f"DeviceID={device['device_id']}  UDID={device['udid']}  "
+              f"connection={device['connection_type']}")
+
+
+def cmd_tunnel(cam, args):
+    """Runs an iproxy-equivalent forwarder. Needed for tools that must have a
+    real TCP endpoint (ffmpeg, VLC, OpenCV); Python callers can use --usbmux."""
+    import usbmux
+
+    if args.ports:
+        local_text, _, device_text = args.ports.partition(":")
+        local_port = int(local_text)
+        device_port = int(device_text) if device_text else local_port
+    else:
+        local_port = device_port = args.port
+
+    server = usbmux.forward(local_port, device_port, udid=args.udid, bind=args.bind)
+    print(f"Ctrl-C to stop. Try: curl http://{args.bind}:{local_port}/status", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
+
+
 def cmd_health(cam, args):
     emit(cam.health(), True)
 
@@ -74,12 +108,15 @@ def cmd_status(cam, args):
 
     api, device, session, controls = status["api"], status["device"], status["session"], status["controls"]
     config, storage, stream = session["config"], status["storage"], status["stream"]
+    # Nullable fields are read with .get(): builds before the Nullable wrapper
+    # omitted them entirely rather than emitting null.
+    battery = device.get("batteryLevel")
 
     print(f"CameraAPI {api['version']}  ·  up {api['uptimeSeconds']:.0f}s  ·  port {api['port']} ({api['accessMode']})")
     print(f"Device    {device['name']} · iOS {device['systemVersion']} · thermal {device['thermalState']}"
-          + (f" · battery {device['batteryLevel'] * 100:.0f}% ({device['batteryState']})" if device["batteryLevel"] is not None else ""))
+          + (f" · battery {battery * 100:.0f}% ({device['batteryState']})" if battery is not None else ""))
     print(f"Session   {'running' if session['running'] else 'STOPPED'}"
-          + (" · INTERRUPTED: " + str(session["interruptionReason"]) if session["interrupted"] else ""))
+          + (" · INTERRUPTED: " + str(session.get("interruptionReason")) if session["interrupted"] else ""))
     print(f"Format    {config['width']}x{config['height']} @ {config['fps']:g} fps · {config['codec']} "
           f"{config['bitrate'] / 1e6:.1f} Mbps · rotation {config['rotationDegrees']}° · "
           f"audio {'on' if config['audioEnabled'] else 'off'} · camera {config['cameraPosition']}")
@@ -87,18 +124,18 @@ def cmd_status(cam, args):
           f"exposure {controls['exposureMode']} (1/{1 / controls['exposureDurationSeconds']:.0f}s ISO {controls['iso']:.0f}) · "
           f"wb {controls['whiteBalanceMode']} ({controls['temperature']:.0f}K) · zoom {controls['zoom']:.2f}x")
 
-    if status["recording"]:
-        rec = status["recording"]
+    rec = status.get("recording")
+    if rec:
         print(f"RECORDING {rec['name']} · {rec['durationSeconds']:.1f}s · {rec['framesWritten']} frames "
               f"({rec['framesDropped']} dropped) · {human_bytes(rec['bytesWritten'])}")
     else:
         print("Recording idle")
 
     print(f"Storage   {storage['recordingCount']} file(s) · {human_bytes(storage['totalBytes'])} used · "
-          f"{human_bytes(storage['freeDiskBytes'])} free")
+          f"{human_bytes(storage.get('freeDiskBytes'))} free")
     print(f"Clients   {api['mjpegClients']} stream · {api['eventClients']} events · {api['httpConnections']} http")
 
-    if session["lastError"]:
+    if session.get("lastError"):
         print(f"Error     {session['lastError']}")
 
 
@@ -159,6 +196,21 @@ def cmd_configure(cam, args):
           f"audio {'on' if config['audioEnabled'] else 'off'} (format index {config['formatIndex']})")
 
 
+def print_controls(state):
+    shutter = f"1/{1 / state['exposureDurationSeconds']:.0f}s" if state["exposureDurationSeconds"] else "?"
+    print(f"focus     {state['focusMode']} (lensPosition {state['lensPosition']:.3f})")
+    print(f"exposure  {state['exposureMode']} ({shutter}, ISO {state['iso']:.0f}, bias {state['exposureTargetBias']:+.1f} EV)")
+    print(f"wb        {state['whiteBalanceMode']} ({state['temperature']:.0f}K, tint {state['tint']:+.0f})")
+    print(f"zoom      {state['zoom']:.2f}x")
+    print(f"torch     {'on' if state['torchOn'] else 'off'} (level {state['torchLevel']:.2f})")
+
+
+def cmd_controls(cam, args):
+    state = cam.controls()
+    if not emit(state, args.json):
+        print_controls(state)
+
+
 def cmd_control(cam, args):
     focus = {}
     if args.focus:
@@ -200,18 +252,16 @@ def cmd_control(cam, args):
         zoom=args.zoom,
         torch=torch or None,
     )
-    if emit(result, args.json):
-        return
-    print(f"focus {result['focusMode']} ({result['lensPosition']:.2f}) · "
-          f"exposure {result['exposureMode']} (1/{1 / result['exposureDurationSeconds']:.0f}s ISO {result['iso']:.0f}) · "
-          f"wb {result['whiteBalanceMode']} ({result['temperature']:.0f}K) · zoom {result['zoom']:.2f}x · "
-          f"torch {'on' if result['torchOn'] else 'off'}")
+    if not emit(result, args.json):
+        print_controls(result)
 
 
 def cmd_lock(cam, args):
-    result = cam.lock_everything()
+    result = cam.lock_everything(converge=args.converge)
     if not emit(result, args.json):
-        print("Locked focus, exposure and white balance.")
+        how = "Converged once, then locked" if args.converge else "Locked at current values"
+        print(f"{how}: focus, exposure and white balance.")
+        print_controls(result)
 
 
 def cmd_record_start(cam, args):
@@ -357,7 +407,9 @@ def cmd_stream(cam, args):
                 sys.stdout.buffer.write(jpeg)
                 sys.stdout.buffer.flush()
             count += 1
-            if args.outdir:
+            # Carriage-return progress only makes sense on a terminal; piped to a
+            # log it would be one enormous line.
+            if args.outdir and sys.stderr.isatty():
                 elapsed = time.monotonic() - started
                 sys.stderr.write(f"\r{count} frames · {count / elapsed:.1f} fps")
                 sys.stderr.flush()
@@ -368,7 +420,11 @@ def cmd_stream(cam, args):
     finally:
         stream.close()
         if args.outdir:
-            sys.stderr.write("\n")
+            elapsed = time.monotonic() - started
+            if sys.stderr.isatty():
+                sys.stderr.write("\r\033[K")
+            print(f"{count} frames in {elapsed:.1f}s ({count / elapsed:.1f} fps) -> {args.outdir}",
+                  file=sys.stderr)
 
 
 def cmd_events(cam, args):
@@ -389,7 +445,7 @@ def cmd_watch(cam, args):
         while True:
             status = cam.status()
             config = status["session"]["config"]
-            recording = status["recording"]
+            recording = status.get("recording")
 
             if recording:
                 state = f"REC {recording['durationSeconds']:5.1f}s {recording['framesWritten']:6d}f"
@@ -407,7 +463,7 @@ def cmd_watch(cam, args):
                 f"{state:<28}  "
                 f"thermal={status['device']['thermalState']}  "
                 f"stream={status['api']['mjpegClients']}  "
-                f"free={human_bytes(status['storage']['freeDiskBytes'])}"
+                f"free={human_bytes(status['storage'].get('freeDiskBytes'))}"
             )
             sys.stdout.write("\r\033[K" + line)
             sys.stdout.flush()
@@ -430,8 +486,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=int(os.environ.get("CAMERA_API_PORT", "8080")))
     parser.add_argument("--token", default=os.environ.get("CAMERA_API_TOKEN"))
     parser.add_argument("--json", action="store_true", help="emit raw JSON")
+    parser.add_argument("--usbmux", action="store_true",
+                        help="tunnel through usbmuxd directly — no iproxy, no root")
+    parser.add_argument("--udid", default=os.environ.get("CAMERA_API_UDID"),
+                        help="pick a device when several are attached")
 
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("devices", help="list attached iOS devices via usbmuxd").set_defaults(func=cmd_devices)
+
+    tunnel = sub.add_parser("tunnel", help="local TCP port -> device port (an iproxy replacement)")
+    tunnel.add_argument("ports", nargs="?", default=None, metavar="LOCAL:DEVICE",
+                        help="default: <--port>:<--port>")
+    tunnel.add_argument("--bind", default="127.0.0.1")
+    tunnel.set_defaults(func=cmd_tunnel)
 
     sub.add_parser("health", help="liveness probe").set_defaults(func=cmd_health)
     sub.add_parser("status", help="full device and session status").set_defaults(func=cmd_status)
@@ -456,21 +524,27 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--no-audio", action="store_true")
     configure.set_defaults(func=cmd_configure)
 
+    sub.add_parser("controls", help="read current focus/exposure/white balance/zoom/torch").set_defaults(func=cmd_controls)
+
     control = sub.add_parser("control", help="focus, exposure, white balance, zoom, torch")
-    control.add_argument("--focus", choices=["auto", "locked", "manual"])
+    control.add_argument("--focus", choices=["auto", "single", "locked", "manual"],
+                         help="single = focus once then hold (AF-S)")
     control.add_argument("--lens", type=float, help="lens position 0.0 (near) to 1.0 (far)")
-    control.add_argument("--exposure", choices=["auto", "locked", "manual"])
+    control.add_argument("--exposure", choices=["auto", "single", "locked", "manual"])
     control.add_argument("--shutter", type=float, help="exposure duration in seconds, e.g. 0.008")
     control.add_argument("--iso", type=float)
     control.add_argument("--ev", type=float, help="exposure target bias")
-    control.add_argument("--wb", choices=["auto", "locked", "manual"])
+    control.add_argument("--wb", choices=["auto", "single", "locked", "manual"])
     control.add_argument("--temperature", type=float, help="white balance in Kelvin")
     control.add_argument("--zoom", type=float)
     control.add_argument("--torch", choices=["on", "off"])
     control.add_argument("--torch-level", type=float, help="0.0 to 1.0")
     control.set_defaults(func=cmd_control)
 
-    sub.add_parser("lock", help="lock focus, exposure and white balance").set_defaults(func=cmd_lock)
+    lock = sub.add_parser("lock", help="stop focus/exposure/white balance drifting between takes")
+    lock.add_argument("--converge", action="store_true",
+                      help="run a single-shot pass on each first, then lock the result")
+    lock.set_defaults(func=cmd_lock)
 
     record = sub.add_parser("record", help="start/stop/inspect a recording")
     record_sub = record.add_subparsers(dest="record_command", required=True)
@@ -537,13 +611,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    cam = CameraAPI(host=args.host, port=args.port, token=args.token)
+    cam = CameraAPI(host=args.host, port=args.port, token=args.token,
+                    usbmux=args.usbmux, udid=args.udid)
     try:
         args.func(cam, args)
     except HTTPError as exc:
         print(f"error: {exc.message} ({exc.code}, HTTP {exc.status})", file=sys.stderr)
         return 2
     except CameraAPIError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        # usbmux errors reached via `camctl devices` / `tunnel`, which bypass
+        # CameraAPI's transport wrapping.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except BrokenPipeError:

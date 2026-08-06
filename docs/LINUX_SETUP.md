@@ -55,6 +55,45 @@ The pairing record lives in `/var/lib/lockdown/` (or `/var/db/lockdown/`) and
 survives reboots. It is invalidated by "Reset Location & Privacy" on the phone,
 by a factory reset, and occasionally by a major iOS update.
 
+## Without root: skip `iproxy` entirely
+
+`usbmuxd` itself ships in the base `usbmuxd` package and runs as a system
+service, but `iproxy` lives in `libusbmuxd-tools`, which you may not be able to
+install on a shared or managed host.
+
+You do not need it. The daemon listens on a **world-writable** Unix socket and
+speaks a small plist protocol, which [`client/usbmux.py`](../client/usbmux.py)
+implements in pure Python. Nothing to install, no root:
+
+```bash
+./client/camctl devices
+```
+
+```bash
+./client/camctl --usbmux status
+```
+
+```python
+from camera_api import CameraAPI
+cam = CameraAPI(usbmux=True)          # no local port, no iproxy
+```
+
+Set `CAMERA_API_USBMUX=1` to make it the default for every invocation.
+
+For tools that need a real TCP endpoint — ffmpeg, VLC, OpenCV — run the built-in
+forwarder instead of `iproxy`. It is a drop-in equivalent:
+
+```bash
+./client/camctl tunnel 8080:8080
+```
+
+```bash
+python3 client/usbmux.py forward 8080:8080
+```
+
+The rest of this document assumes `iproxy`; substitute either of the above
+wherever you see it.
+
 ## 3. Forward the port
 
 ```bash
@@ -130,6 +169,8 @@ ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", TAG+="systemd", ENV{SYS
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Connection refused` on port 8080 | `iproxy` not running, or the app is not in the foreground | Start `iproxy`; bring the app to the front |
+| `usbmuxd is not listening … the socket file is stale` | No device attached. `usbmuxd` is socket-activated and exits when the last one is unplugged, leaving the socket file behind | Replug the cable; confirm with `lsusb \| grep -i apple` |
+| `iproxy: command not found` | `libusbmuxd-tools` not installed and no root to install it | Use `camctl --usbmux`, or `camctl tunnel 8080:8080` |
 | `No device found` from `iproxy` | Not paired, or `usbmuxd` is not running | `idevicepair pair`; `systemctl start usbmuxd` |
 | `ERROR: Please accept the trust dialog` | Trust prompt not confirmed | Unlock the phone, tap Trust, re-run `idevicepair pair` |
 | Pairing succeeds then fails later | `usbmuxd` and a running `usbmuxd` from another source both claiming the device | `systemctl stop usbmuxd` and let socket activation handle it |
@@ -153,17 +194,26 @@ Log out and back in.
 
 ## Throughput expectations
 
-Lightning is USB 2.0: expect roughly **20–35 MB/s** in practice through the mux.
-USB-C iPhones can do better, but do not design around it.
+Measured through `usbmuxd` on a USB-C iPhone: **40.8 MB/s** pulling a 167 MB
+recording (4.1 s). A Lightning device is USB 2.0 and will land closer to
+20–35 MB/s. Measure yours rather than trusting either number:
+
+```bash
+./client/camctl clip 10 -o /tmp/probe.mov
+```
 
 | Workload | Bandwidth | Fits over USB? |
 |---|---|---|
 | 720p60 H.264 @ 8 Mbps | 1 MB/s | Comfortably |
 | 1080p60 H.264 @ 20 Mbps | 2.5 MB/s | Comfortably |
+| 720p**240** H.264 @ 22 Mbps | 2.8 MB/s | Yes — measured, 0.2% frames dropped |
 | 4K60 HEVC @ 50 Mbps | 6 MB/s | Yes |
 | MJPEG 640×480 @ 30 fps | ~1.5 MB/s | Yes |
 | Raw 720p BGRA @ 60 fps | 220 MB/s | No — record locally and pull |
 | ProRes | ~190 MB/s | No — record locally and pull |
+
+At 240 fps the phone writes 2.8 MB/s while the link sustains ~40 MB/s, so
+offloading finished footage while still recording has roughly 15× headroom.
 
 Remember that **recording is not affected by any of this**. The phone writes to
 its own flash; USB only matters for streaming and for downloading afterwards.
@@ -211,6 +261,51 @@ ffmpeg -i 'http://localhost:8080/stream.mjpeg?fps=30&maxWidth=1280' -c:v libx264
 ```bash
 ./client/camctl clip 30 -o take.mov
 ```
+
+**Highest frame rate the sensor offers**
+
+```bash
+./client/camctl configure --width 1280 --height 720 --fps 240 --codec h264 --no-audio
+```
+
+240 fps is available at 1280×720 and 1920×1080 (both binned); everything else
+caps at 60. Measured over a full minute: 14,442 frames, 30 dropped (0.21%),
+thermal state never left `nominal`.
+
+**Long continuous recording**
+
+Recording is not USB-bound — the phone writes to its own flash, so the only
+ceiling is storage. At 240 fps 720p that is 2.78 MB/s, about **7.4 hours** on
+74 GB free; at 60 fps, roughly a day.
+
+```bash
+./client/camctl record start --name session1
+```
+
+```bash
+./client/camctl watch          # live frame count, drops, thermal state
+```
+
+```bash
+./client/camctl record stop && ./client/camctl files pull --all -o ./footage --delete
+```
+
+`--delete` removes each file from the phone **only after** the download
+completes and the byte count matches what the server reported; a short or
+interrupted transfer raises instead, and nothing is deleted.
+
+> **One long file is all-or-nothing.** The recording is not readable until it is
+> stopped, so if the app is killed mid-run — backgrounded, jetsammed, or the
+> device rebooted — the whole take is lost. For multi-hour sessions, bound the
+> risk with `--max-duration` and restart in a loop, so a failure costs one chunk
+> rather than everything:
+>
+> ```bash
+> while true; do ./client/camctl clip 600 -o "seg-$(date +%s).mov"; done
+> ```
+>
+> That leaves a short gap at each boundary. Genuinely gapless continuous capture
+> would need segment rotation inside the app, which it does not currently do.
 
 **Pull everything, then wipe the device**
 
