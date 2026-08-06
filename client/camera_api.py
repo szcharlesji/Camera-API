@@ -1,0 +1,574 @@
+"""Python client for the CameraAPI iPhone app.
+
+Standard library only — no pip install required on the Linux host.
+
+    from camera_api import CameraAPI
+
+    cam = CameraAPI()                       # 127.0.0.1:8080, i.e. through iproxy
+    cam.configure(width=1280, height=720, fps=60)
+    with cam.record(name="take1") as rec:
+        time.sleep(5)
+    cam.download(rec.result["id"], "take1.mov")
+
+See docs/API.md for the full endpoint reference.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import socket
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, Optional
+
+__all__ = [
+    "CameraAPI",
+    "CameraAPIError",
+    "HTTPError",
+    "Recording",
+    "DEFAULT_HOST",
+    "DEFAULT_PORT",
+]
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+
+
+class CameraAPIError(RuntimeError):
+    """Base class for every error this client raises."""
+
+
+class HTTPError(CameraAPIError):
+    """The API returned a non-2xx status.
+
+    ``code`` and ``message`` come from the server's JSON error body when present,
+    so ``except HTTPError as e: if e.code == "conflict"`` is a reliable check.
+    """
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(f"HTTP {status} {code}: {message}")
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class Recording:
+    """Handle returned by :meth:`CameraAPI.record`.
+
+    ``result`` is populated with the finished recording's metadata when the
+    context manager exits.
+    """
+
+    id: str
+    name: str
+    started: dict = field(default_factory=dict)
+    result: Optional[dict] = None
+
+
+class CameraAPI:
+    """A connection to one iPhone running the CameraAPI app."""
+
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        token: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        self.host = host
+        self.port = port
+        self.token = token or os.environ.get("CAMERA_API_TOKEN") or None
+        self.timeout = timeout
+
+    # ------------------------------------------------------------------ plumbing
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def _url(self, path: str, params: Optional[dict] = None) -> str:
+        url = f"{self.base_url}{path}"
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None}
+            if clean:
+                url += "?" + urllib.parse.urlencode(clean)
+        return url
+
+    def _headers(self) -> dict:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _open(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+        timeout: Optional[float] = None,
+        extra_headers: Optional[dict] = None,
+    ):
+        """Issues a request and returns the raw response object."""
+        data = None
+        headers = self._headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        request = urllib.request.Request(
+            self._url(path, params), data=data, headers=headers, method=method
+        )
+        try:
+            return urllib.request.urlopen(
+                request, timeout=self.timeout if timeout is None else timeout
+            )
+        except urllib.error.HTTPError as exc:
+            raise self._to_error(exc) from None
+        except urllib.error.URLError as exc:
+            raise CameraAPIError(
+                f"Could not reach {self.base_url}: {exc.reason}. "
+                f"Is the app in the foreground and 'iproxy {self.port}:{self.port}' running?"
+            ) from None
+        except socket.timeout:
+            raise CameraAPIError(f"Request to {path} timed out after {timeout or self.timeout}s") from None
+
+    @staticmethod
+    def _to_error(exc: urllib.error.HTTPError) -> CameraAPIError:
+        raw = exc.read()
+        try:
+            payload = json.loads(raw)
+            return HTTPError(exc.code, payload.get("error", "error"), payload.get("message", ""))
+        except (ValueError, TypeError):
+            return HTTPError(exc.code, "error", raw.decode("utf-8", "replace")[:500])
+
+    def _json(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        with self._open(method, path, body=body, params=params, timeout=timeout) as response:
+            raw = response.read()
+        if not raw:
+            return None
+        return json.loads(raw)
+
+    # ------------------------------------------------------------------- discovery
+
+    def health(self) -> dict:
+        """Liveness probe. Never requires an auth token."""
+        return self._json("GET", "/health")
+
+    def status(self) -> dict:
+        """Everything: device, session, controls, recording, stream, storage."""
+        return self._json("GET", "/status")
+
+    def cameras(self) -> list:
+        return self._json("GET", "/cameras")["cameras"]
+
+    def formats(self, camera: Optional[str] = None) -> dict:
+        """Every resolution/frame-rate combination the camera supports."""
+        return self._json("GET", "/formats", params={"camera": camera})
+
+    def supported_modes(self, camera: Optional[str] = None, min_fps: float = 0) -> list:
+        """Convenience view of :meth:`formats` as ``(width, height, max_fps)`` tuples."""
+        formats = self.formats(camera)["formats"]
+        modes = {
+            (f["width"], f["height"], f["maxFrameRate"])
+            for f in formats
+            if f["maxFrameRate"] >= min_fps
+        }
+        return sorted(modes, key=lambda m: (m[0] * m[1], m[2]))
+
+    def wait_until_ready(self, timeout: float = 30.0, interval: float = 0.5) -> dict:
+        """Blocks until the server answers and the capture session is running.
+
+        Useful right after launching the app or starting ``iproxy``, when the
+        listener may not be up for another moment.
+        """
+        deadline = time.monotonic() + timeout
+        last_error: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            try:
+                status = self.status()
+                if status["session"]["running"]:
+                    return status
+                last_error = CameraAPIError(
+                    "Session not running: " + str(status["session"].get("lastError") or "unknown")
+                )
+            except CameraAPIError as exc:
+                last_error = exc
+            time.sleep(interval)
+        raise CameraAPIError(f"Camera not ready after {timeout}s ({last_error})")
+
+    # --------------------------------------------------------------- configuration
+
+    def configure(
+        self,
+        camera: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[float] = None,
+        codec: Optional[str] = None,
+        bitrate: Optional[int] = None,
+        audio: Optional[bool] = None,
+        rotation_degrees: Optional[int] = None,
+        stabilization: Optional[str] = None,
+        format_index: Optional[int] = None,
+    ) -> dict:
+        """Reconfigures the capture session. Omitted arguments are left alone.
+
+        Returns the full status document so you can confirm what was actually
+        selected — the app snaps to the nearest supported format and reports it.
+        """
+        body = {
+            "camera": camera,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "codec": codec,
+            "bitrate": bitrate,
+            "audio": audio,
+            "rotationDegrees": rotation_degrees,
+            "stabilization": stabilization,
+            "formatIndex": format_index,
+        }
+        return self._json("POST", "/configure", body={k: v for k, v in body.items() if v is not None})
+
+    def controls(self) -> dict:
+        return self._json("GET", "/controls")
+
+    def control(
+        self,
+        focus: Optional[dict] = None,
+        exposure: Optional[dict] = None,
+        white_balance: Optional[dict] = None,
+        zoom: Optional[float] = None,
+        torch: Optional[dict] = None,
+    ) -> dict:
+        body = {
+            "focus": focus,
+            "exposure": exposure,
+            "whiteBalance": white_balance,
+            "zoom": zoom,
+            "torch": torch,
+        }
+        return self._json("POST", "/control", body={k: v for k, v in body.items() if v is not None})
+
+    def lock_everything(self) -> dict:
+        """Locks focus, exposure and white balance at their current values.
+
+        The usual first step for repeatable capture: it stops the camera
+        re-metering between takes.
+        """
+        return self.control(
+            focus={"mode": "locked"},
+            exposure={"mode": "locked"},
+            white_balance={"mode": "locked"},
+        )
+
+    def set_stream_settings(
+        self,
+        fps: Optional[float] = None,
+        quality: Optional[float] = None,
+        max_width: Optional[int] = None,
+    ) -> dict:
+        body = {"fps": fps, "quality": quality, "maxWidth": max_width}
+        return self._json("POST", "/stream/settings", body={k: v for k, v in body.items() if v is not None})
+
+    # ------------------------------------------------------------------- recording
+
+    def start_recording(
+        self,
+        name: Optional[str] = None,
+        container: str = "mov",
+        max_duration_seconds: Optional[float] = None,
+    ) -> dict:
+        body = {"name": name, "container": container, "maxDurationSeconds": max_duration_seconds}
+        return self._json("POST", "/record/start", body={k: v for k, v in body.items() if v is not None})
+
+    def stop_recording(self, timeout: float = 60.0) -> dict:
+        """Finalises the file and returns its metadata.
+
+        Blocks while the asset writer flushes, which is why the socket timeout is
+        raised above the default.
+        """
+        return self._json("POST", "/record/stop", timeout=timeout)
+
+    def recording_progress(self) -> Optional[dict]:
+        """Progress of the in-flight recording, or ``None`` if idle."""
+        result = self._json("GET", "/record")
+        return None if result.get("ok") else result
+
+    @contextlib.contextmanager
+    def record(
+        self,
+        name: Optional[str] = None,
+        container: str = "mov",
+        max_duration_seconds: Optional[float] = None,
+    ) -> Iterator[Recording]:
+        """Records for the duration of the ``with`` block.
+
+            with cam.record(name="take1") as rec:
+                time.sleep(5)
+            print(rec.result["sizeBytes"])
+
+        The recording is stopped even if the block raises.
+        """
+        started = self.start_recording(name, container, max_duration_seconds)
+        handle = Recording(id=started["id"], name=started["name"], started=started)
+        try:
+            yield handle
+        finally:
+            try:
+                handle.result = self.stop_recording()
+            except HTTPError as exc:
+                # A max-duration auto-stop may have finished it already.
+                if exc.code != "conflict":
+                    raise
+                handle.result = self.get_recording(handle.id)
+
+    def clip(self, seconds: float, name: Optional[str] = None, container: str = "mov") -> dict:
+        """Records for ``seconds`` and returns the finished recording's metadata."""
+        with self.record(name=name, container=container) as handle:
+            time.sleep(seconds)
+        return handle.result
+
+    # ----------------------------------------------------------------------- files
+
+    def list_recordings(self) -> list:
+        return self._json("GET", "/files")["recordings"]
+
+    def storage(self) -> dict:
+        result = self._json("GET", "/files")
+        return {"totalBytes": result["totalBytes"], "freeDiskBytes": result["freeDiskBytes"]}
+
+    def get_recording(self, recording_id: str) -> dict:
+        return self._json("GET", f"/files/{recording_id}")
+
+    def download(
+        self,
+        recording_id: str,
+        destination: str,
+        resume: bool = True,
+        chunk_size: int = 1 << 20,
+        progress: Optional[Callable[[int, int], None]] = None,
+        timeout: float = 600.0,
+    ) -> str:
+        """Downloads a recording to ``destination``.
+
+        With ``resume=True`` an interrupted transfer is continued using an HTTP
+        Range request instead of starting over — worth having on a USB link that
+        can be unplugged.
+
+        ``progress`` is called as ``progress(bytes_done, total_bytes)``.
+        """
+        meta = self.get_recording(recording_id)
+        total = meta["sizeBytes"]
+
+        already = 0
+        mode = "wb"
+        if resume and os.path.exists(destination):
+            already = os.path.getsize(destination)
+            if already == total:
+                if progress:
+                    progress(total, total)
+                return destination
+            if already > total:
+                already = 0
+            else:
+                mode = "ab"
+
+        headers = {"Range": f"bytes={already}-"} if already else None
+        with self._open(
+            "GET", f"/files/{recording_id}/download", extra_headers=headers, timeout=timeout
+        ) as response:
+            with open(destination, mode) as handle:
+                done = already
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+
+        actual = os.path.getsize(destination)
+        if actual != total:
+            raise CameraAPIError(
+                f"Download of {recording_id} is short: got {actual} bytes, expected {total}."
+            )
+        return destination
+
+    def delete(self, recording_id: str) -> dict:
+        return self._json("DELETE", f"/files/{recording_id}")
+
+    def delete_all(self) -> dict:
+        return self._json("DELETE", "/files", params={"confirm": "true"})
+
+    def pull(self, recording_id: str, destination: str, delete_after: bool = False, **kwargs) -> str:
+        """Downloads a recording and optionally frees the space on the phone."""
+        path = self.download(recording_id, destination, **kwargs)
+        if delete_after:
+            self.delete(recording_id)
+        return path
+
+    # ------------------------------------------------------------------------ live
+
+    def snapshot(
+        self,
+        max_width: int = 1920,
+        quality: float = 0.85,
+        timeout: float = 10.0,
+    ) -> bytes:
+        """Returns a single JPEG captured from the next frame."""
+        with self._open(
+            "GET",
+            "/snapshot",
+            params={"maxWidth": max_width, "quality": quality},
+            timeout=timeout,
+        ) as response:
+            return response.read()
+
+    def save_snapshot(self, destination: str, **kwargs) -> str:
+        with open(destination, "wb") as handle:
+            handle.write(self.snapshot(**kwargs))
+        return destination
+
+    def stream_mjpeg(
+        self,
+        fps: Optional[float] = None,
+        quality: Optional[float] = None,
+        max_width: Optional[int] = None,
+        timeout: float = 30.0,
+    ) -> Iterator[bytes]:
+        """Yields JPEG frames from the live stream, forever.
+
+            for jpeg in cam.stream_mjpeg(fps=30):
+                ...
+
+        Each yielded value is a complete JPEG file. Break out of the loop to
+        disconnect.
+        """
+        params = {"fps": fps, "quality": quality, "maxWidth": max_width}
+        response = self._open("GET", "/stream.mjpeg", params=params, timeout=timeout)
+        try:
+            yield from _iter_multipart_jpeg(response)
+        finally:
+            response.close()
+
+    def events(self, timeout: float = 300.0) -> Iterator[tuple]:
+        """Yields ``(event_name, payload_dict)`` from the server-sent event stream.
+
+        The first event is always ``hello`` carrying a full status document.
+        A ``keepalive`` comment arrives every 15s; it is filtered out here.
+        """
+        response = self._open("GET", "/events", timeout=timeout)
+        try:
+            yield from _iter_sse(response)
+        finally:
+            response.close()
+
+    # ---------------------------------------------------------------------- server
+
+    def set_server_settings(
+        self,
+        port: Optional[int] = None,
+        access_mode: Optional[str] = None,
+        auth_token: Optional[str] = None,
+    ) -> dict:
+        """Rebinds the listener. The current connection will drop."""
+        body = {"port": port, "accessMode": access_mode, "authToken": auth_token}
+        return self._json("POST", "/server/settings", body={k: v for k, v in body.items() if v is not None})
+
+
+# --------------------------------------------------------------------- stream parsing
+
+
+def _read_line(stream) -> bytes:
+    """Reads one CRLF-terminated line without over-reading into the body."""
+    line = bytearray()
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            return bytes(line)
+        line += byte
+        if line.endswith(b"\r\n"):
+            return bytes(line)
+
+
+def _iter_multipart_jpeg(stream) -> Iterator[bytes]:
+    """Parses ``multipart/x-mixed-replace`` into individual JPEG payloads."""
+    while True:
+        # Skip forward to the next part boundary.
+        line = _read_line(stream)
+        if not line:
+            return
+        if not line.startswith(b"--"):
+            continue
+
+        length = None
+        while True:
+            header = _read_line(stream)
+            if not header or header == b"\r\n":
+                break
+            name, _, value = header.decode("latin-1").partition(":")
+            if name.strip().lower() == "content-length":
+                length = int(value.strip())
+
+        if length is None:
+            # Without a length there is no safe way to find the payload end.
+            raise CameraAPIError("MJPEG part is missing Content-Length")
+
+        payload = bytearray()
+        while len(payload) < length:
+            chunk = stream.read(length - len(payload))
+            if not chunk:
+                return
+            payload += chunk
+
+        yield bytes(payload)
+
+
+def _iter_sse(stream) -> Iterator[tuple]:
+    """Parses ``text/event-stream`` into ``(event, payload)`` pairs."""
+    event = "message"
+    data_lines = []
+    while True:
+        raw = stream.readline()
+        if not raw:
+            return
+        line = raw.decode("utf-8", "replace").rstrip("\n").rstrip("\r")
+
+        if not line:
+            if data_lines:
+                blob = "\n".join(data_lines)
+                try:
+                    payload = json.loads(blob)
+                except ValueError:
+                    payload = {"raw": blob}
+                yield event, payload
+            event = "message"
+            data_lines = []
+            continue
+
+        if line.startswith(":"):
+            continue  # keepalive comment
+        field, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if field == "event":
+            event = value
+        elif field == "data":
+            data_lines.append(value)

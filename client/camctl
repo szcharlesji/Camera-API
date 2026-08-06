@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""camctl — command line control for the CameraAPI iPhone app.
+
+    camctl status
+    camctl formats --min-fps 60
+    camctl configure --width 1280 --height 720 --fps 60
+    camctl clip 10 -o take1.mov
+    camctl files pull --all -o ./footage
+
+Every subcommand accepts --host/--port/--token; defaults target a local
+`iproxy 8080:8080` tunnel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from camera_api import CameraAPI, CameraAPIError, HTTPError  # noqa: E402
+
+
+# ------------------------------------------------------------------ formatting
+
+
+def human_bytes(count) -> str:
+    if count is None:
+        return "?"
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1000 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+def emit(data, as_json: bool):
+    if as_json:
+        json.dump(data, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return True
+    return False
+
+
+def progress_bar(done: int, total: int):
+    if not sys.stderr.isatty() or not total:
+        return
+    fraction = done / total
+    width = 30
+    filled = int(width * fraction)
+    sys.stderr.write(
+        f"\r  [{'=' * filled}{' ' * (width - filled)}] {fraction * 100:5.1f}%  {human_bytes(done)}"
+    )
+    if done >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+# -------------------------------------------------------------------- commands
+
+
+def cmd_health(cam, args):
+    emit(cam.health(), True)
+
+
+def cmd_status(cam, args):
+    status = cam.status()
+    if emit(status, args.json):
+        return
+
+    api, device, session, controls = status["api"], status["device"], status["session"], status["controls"]
+    config, storage, stream = session["config"], status["storage"], status["stream"]
+
+    print(f"CameraAPI {api['version']}  ·  up {api['uptimeSeconds']:.0f}s  ·  port {api['port']} ({api['accessMode']})")
+    print(f"Device    {device['name']} · iOS {device['systemVersion']} · thermal {device['thermalState']}"
+          + (f" · battery {device['batteryLevel'] * 100:.0f}% ({device['batteryState']})" if device["batteryLevel"] is not None else ""))
+    print(f"Session   {'running' if session['running'] else 'STOPPED'}"
+          + (" · INTERRUPTED: " + str(session["interruptionReason"]) if session["interrupted"] else ""))
+    print(f"Format    {config['width']}x{config['height']} @ {config['fps']:g} fps · {config['codec']} "
+          f"{config['bitrate'] / 1e6:.1f} Mbps · rotation {config['rotationDegrees']}° · "
+          f"audio {'on' if config['audioEnabled'] else 'off'} · camera {config['cameraPosition']}")
+    print(f"Controls  focus {controls['focusMode']} ({controls['lensPosition']:.2f}) · "
+          f"exposure {controls['exposureMode']} (1/{1 / controls['exposureDurationSeconds']:.0f}s ISO {controls['iso']:.0f}) · "
+          f"wb {controls['whiteBalanceMode']} ({controls['temperature']:.0f}K) · zoom {controls['zoom']:.2f}x")
+
+    if status["recording"]:
+        rec = status["recording"]
+        print(f"RECORDING {rec['name']} · {rec['durationSeconds']:.1f}s · {rec['framesWritten']} frames "
+              f"({rec['framesDropped']} dropped) · {human_bytes(rec['bytesWritten'])}")
+    else:
+        print("Recording idle")
+
+    print(f"Storage   {storage['recordingCount']} file(s) · {human_bytes(storage['totalBytes'])} used · "
+          f"{human_bytes(storage['freeDiskBytes'])} free")
+    print(f"Clients   {api['mjpegClients']} stream · {api['eventClients']} events · {api['httpConnections']} http")
+
+    if session["lastError"]:
+        print(f"Error     {session['lastError']}")
+
+
+def cmd_cameras(cam, args):
+    cameras = cam.cameras()
+    if emit(cameras, args.json):
+        return
+    for camera in cameras:
+        marker = "*" if camera["isActive"] else " "
+        print(f"{marker} {camera['position']:<12} {camera['localizedName']:<32} zoom {camera['minZoom']:g}-{camera['maxZoom']:g}"
+              + ("  torch" if camera["hasTorch"] else ""))
+        print(f"    {camera['uniqueID']}")
+
+
+def cmd_formats(cam, args):
+    result = cam.formats(args.camera)
+    if emit(result, args.json):
+        return
+
+    print(f"{result['camera']['localizedName']} ({result['camera']['position']})\n")
+    print(f"{'idx':>4}  {'resolution':>12}  {'fps range':>14}  {'fmt':>6}  {'fov':>5}  {'zoom':>6}  binned")
+    print("-" * 68)
+    for entry in result["formats"]:
+        if entry["maxFrameRate"] < args.min_fps:
+            continue
+        marker = "*" if entry["isActive"] else " "
+        rate = f"{entry['minFrameRate']:g}-{entry['maxFrameRate']:g}"
+        print(f"{entry['index']:>3}{marker} {entry['width']:>6}x{entry['height']:<5} {rate:>14}  "
+              f"{entry['pixelFormat']:>6}  {entry['fieldOfView']:>5.1f}  {entry['maxZoomFactor']:>6.1f}  "
+              f"{'yes' if entry['isBinned'] else ''}")
+    print("\n* = currently active. Pass --format-index to `configure` to pin one exactly.")
+
+
+def cmd_configure(cam, args):
+    audio = None
+    if args.audio:
+        audio = True
+    elif args.no_audio:
+        audio = False
+
+    status = cam.configure(
+        camera=args.camera,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        codec=args.codec,
+        bitrate=args.bitrate,
+        audio=audio,
+        rotation_degrees=args.rotation,
+        stabilization=args.stabilization,
+        format_index=args.format_index,
+    )
+    if emit(status, args.json):
+        return
+    config = status["session"]["config"]
+    print(f"Applied: {config['width']}x{config['height']} @ {config['fps']:g} fps · {config['codec']} "
+          f"{config['bitrate'] / 1e6:.1f} Mbps · rotation {config['rotationDegrees']}° · "
+          f"audio {'on' if config['audioEnabled'] else 'off'} (format index {config['formatIndex']})")
+
+
+def cmd_control(cam, args):
+    focus = {}
+    if args.focus:
+        focus["mode"] = args.focus
+    if args.lens is not None:
+        focus["mode"] = focus.get("mode", "manual")
+        focus["lensPosition"] = args.lens
+
+    exposure = {}
+    if args.exposure:
+        exposure["mode"] = args.exposure
+    if args.shutter is not None:
+        exposure["mode"] = exposure.get("mode", "manual")
+        exposure["durationSeconds"] = args.shutter
+    if args.iso is not None:
+        exposure["mode"] = exposure.get("mode", "manual")
+        exposure["iso"] = args.iso
+    if args.ev is not None:
+        exposure["targetBias"] = args.ev
+
+    white_balance = {}
+    if args.wb:
+        white_balance["mode"] = args.wb
+    if args.temperature is not None:
+        white_balance["mode"] = white_balance.get("mode", "manual")
+        white_balance["temperature"] = args.temperature
+
+    torch = {}
+    if args.torch:
+        torch["on"] = args.torch == "on"
+    if args.torch_level is not None:
+        torch["on"] = True
+        torch["level"] = args.torch_level
+
+    result = cam.control(
+        focus=focus or None,
+        exposure=exposure or None,
+        white_balance=white_balance or None,
+        zoom=args.zoom,
+        torch=torch or None,
+    )
+    if emit(result, args.json):
+        return
+    print(f"focus {result['focusMode']} ({result['lensPosition']:.2f}) · "
+          f"exposure {result['exposureMode']} (1/{1 / result['exposureDurationSeconds']:.0f}s ISO {result['iso']:.0f}) · "
+          f"wb {result['whiteBalanceMode']} ({result['temperature']:.0f}K) · zoom {result['zoom']:.2f}x · "
+          f"torch {'on' if result['torchOn'] else 'off'}")
+
+
+def cmd_lock(cam, args):
+    result = cam.lock_everything()
+    if not emit(result, args.json):
+        print("Locked focus, exposure and white balance.")
+
+
+def cmd_record_start(cam, args):
+    result = cam.start_recording(args.name, args.container, args.max_duration)
+    if not emit(result, args.json):
+        print(f"Recording {result['id']} started ({result['name']})")
+
+
+def cmd_record_stop(cam, args):
+    result = cam.stop_recording()
+    if not emit(result, args.json):
+        print(f"Recording {result['id']} finished: {result['durationSeconds']:.2f}s · "
+              f"{result['framesWritten']} frames ({result['framesDropped']} dropped) · "
+              f"{human_bytes(result['sizeBytes'])} · {result['width']}x{result['height']} {result['codec']}")
+
+
+def cmd_record_status(cam, args):
+    progress = cam.recording_progress()
+    if progress is None:
+        if not args.json:
+            print("Idle")
+        else:
+            emit(None, True)
+        return
+    if not emit(progress, args.json):
+        print(f"{progress['name']} · {progress['durationSeconds']:.1f}s · {progress['framesWritten']} frames · "
+              f"{human_bytes(progress['bytesWritten'])}")
+
+
+def cmd_clip(cam, args):
+    print(f"Recording {args.seconds}s…", file=sys.stderr)
+    meta = cam.clip(args.seconds, name=args.name, container=args.container)
+    effective_fps = meta["framesWritten"] / meta["durationSeconds"] if meta["durationSeconds"] else 0
+    print(f"Captured {meta['durationSeconds']:.2f}s · {meta['framesWritten']} frames "
+          f"({effective_fps:.1f} fps effective, {meta['framesDropped']} dropped) · {human_bytes(meta['sizeBytes'])}",
+          file=sys.stderr)
+
+    destination = args.output or f"{meta['name']}.{meta['container']}"
+    print(f"Downloading to {destination}", file=sys.stderr)
+    cam.download(meta["id"], destination, progress=progress_bar)
+
+    if not args.keep:
+        cam.delete(meta["id"])
+        print("Deleted from device.", file=sys.stderr)
+
+    if args.json:
+        emit(meta, True)
+    else:
+        print(destination)
+
+
+def cmd_files_list(cam, args):
+    recordings = cam.list_recordings()
+    if emit(recordings, args.json):
+        return
+    if not recordings:
+        print("No recordings on device.")
+        return
+    print(f"{'id':<38} {'name':<20} {'when':<20} {'dur':>8} {'size':>10}  format")
+    print("-" * 110)
+    for entry in recordings:
+        print(f"{entry['id']:<38} {entry['name'][:20]:<20} {entry['createdAt'][:19]:<20} "
+              f"{entry['durationSeconds']:>7.1f}s {human_bytes(entry['sizeBytes']):>10}  "
+              f"{entry['width']}x{entry['height']} {entry['codec']} {entry['fps']:g}fps")
+    storage = cam.storage()
+    print(f"\n{len(recordings)} file(s) · {human_bytes(storage['totalBytes'])} used · "
+          f"{human_bytes(storage['freeDiskBytes'])} free")
+
+
+def cmd_files_pull(cam, args):
+    if args.all:
+        recordings = cam.list_recordings()
+        if not recordings:
+            print("No recordings to pull.", file=sys.stderr)
+            return
+        directory = args.output or "."
+        os.makedirs(directory, exist_ok=True)
+        for entry in recordings:
+            destination = os.path.join(directory, f"{entry['name']}.{entry['container']}")
+            print(f"{entry['id']} -> {destination}", file=sys.stderr)
+            cam.download(entry["id"], destination, progress=progress_bar)
+            if args.delete:
+                cam.delete(entry["id"])
+        print(f"Pulled {len(recordings)} recording(s) into {directory}", file=sys.stderr)
+        return
+
+    if not args.id:
+        raise SystemExit("camctl files pull: provide a recording id or --all")
+
+    meta = cam.get_recording(args.id)
+    destination = args.output or f"{meta['name']}.{meta['container']}"
+    cam.download(args.id, destination, progress=progress_bar)
+    if args.delete:
+        cam.delete(args.id)
+    print(destination)
+
+
+def cmd_files_rm(cam, args):
+    if args.all:
+        result = cam.delete_all()
+        print(f"Deleted {len(result['deleted'])} recording(s), freed {human_bytes(result['freedBytes'])}")
+        return
+    if not args.id:
+        raise SystemExit("camctl files rm: provide a recording id or --all")
+    result = cam.delete(args.id)
+    print(f"Deleted {args.id}, freed {human_bytes(result['freedBytes'])}")
+
+
+def cmd_snapshot(cam, args):
+    data = cam.snapshot(max_width=args.max_width, quality=args.quality)
+    if args.output == "-":
+        sys.stdout.buffer.write(data)
+        return
+    with open(args.output, "wb") as handle:
+        handle.write(data)
+    print(f"{args.output} ({human_bytes(len(data))})")
+
+
+def cmd_stream(cam, args):
+    if args.url:
+        params = []
+        if args.fps:
+            params.append(f"fps={args.fps}")
+        if args.quality:
+            params.append(f"quality={args.quality}")
+        if args.max_width:
+            params.append(f"maxWidth={args.max_width}")
+        query = ("?" + "&".join(params)) if params else ""
+        print(f"{cam.base_url}/stream.mjpeg{query}")
+        return
+
+    count = 0
+    started = time.monotonic()
+    stream = cam.stream_mjpeg(fps=args.fps, quality=args.quality, max_width=args.max_width)
+    try:
+        for jpeg in stream:
+            if args.outdir:
+                os.makedirs(args.outdir, exist_ok=True)
+                path = os.path.join(args.outdir, f"frame_{count:06d}.jpg")
+                with open(path, "wb") as handle:
+                    handle.write(jpeg)
+            else:
+                sys.stdout.buffer.write(jpeg)
+                sys.stdout.buffer.flush()
+            count += 1
+            if args.outdir:
+                elapsed = time.monotonic() - started
+                sys.stderr.write(f"\r{count} frames · {count / elapsed:.1f} fps")
+                sys.stderr.flush()
+            if args.frames and count >= args.frames:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.close()
+        if args.outdir:
+            sys.stderr.write("\n")
+
+
+def cmd_events(cam, args):
+    for name, payload in cam.events():
+        if name == "hello" and not args.include_hello:
+            continue
+        stamp = payload.get("timestamp", "")
+        if args.json:
+            json.dump({"event": name, "payload": payload}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(f"{stamp[:19]}  {name}  {json.dumps(payload.get('payload', payload))[:160]}")
+        sys.stdout.flush()
+
+
+def cmd_watch(cam, args):
+    try:
+        while True:
+            status = cam.status()
+            config = status["session"]["config"]
+            recording = status["recording"]
+
+            if recording:
+                state = f"REC {recording['durationSeconds']:5.1f}s {recording['framesWritten']:6d}f"
+                if recording["framesDropped"]:
+                    state += f" (-{recording['framesDropped']})"
+            elif status["session"]["interrupted"]:
+                state = "INTERRUPTED"
+            elif not status["session"]["running"]:
+                state = "STOPPED"
+            else:
+                state = "idle"
+
+            line = (
+                f"{config['width']}x{config['height']}@{config['fps']:g}  "
+                f"{state:<28}  "
+                f"thermal={status['device']['thermalState']}  "
+                f"stream={status['api']['mjpegClients']}  "
+                f"free={human_bytes(status['storage']['freeDiskBytes'])}"
+            )
+            sys.stdout.write("\r\033[K" + line)
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+
+
+# ------------------------------------------------------------------------ main
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="camctl",
+        description="Control an iPhone running the CameraAPI app over USB.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Start the tunnel first:  iproxy 8080:8080 &",
+    )
+    parser.add_argument("--host", default=os.environ.get("CAMERA_API_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("CAMERA_API_PORT", "8080")))
+    parser.add_argument("--token", default=os.environ.get("CAMERA_API_TOKEN"))
+    parser.add_argument("--json", action="store_true", help="emit raw JSON")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("health", help="liveness probe").set_defaults(func=cmd_health)
+    sub.add_parser("status", help="full device and session status").set_defaults(func=cmd_status)
+    sub.add_parser("cameras", help="list capture devices").set_defaults(func=cmd_cameras)
+
+    formats = sub.add_parser("formats", help="list supported resolutions and frame rates")
+    formats.add_argument("--camera", help="uniqueID, 'back' or 'front'")
+    formats.add_argument("--min-fps", type=float, default=0, help="hide formats slower than this")
+    formats.set_defaults(func=cmd_formats)
+
+    configure = sub.add_parser("configure", help="set resolution, frame rate, codec")
+    configure.add_argument("--camera")
+    configure.add_argument("--width", type=int)
+    configure.add_argument("--height", type=int)
+    configure.add_argument("--fps", type=float)
+    configure.add_argument("--codec", choices=["h264", "hevc"])
+    configure.add_argument("--bitrate", type=int, help="bits per second")
+    configure.add_argument("--rotation", type=int, choices=[0, 90, 180, 270])
+    configure.add_argument("--stabilization", choices=["off", "standard", "cinematic", "cinematicExtended", "auto"])
+    configure.add_argument("--format-index", type=int, help="pin an exact format from `camctl formats`")
+    configure.add_argument("--audio", action="store_true")
+    configure.add_argument("--no-audio", action="store_true")
+    configure.set_defaults(func=cmd_configure)
+
+    control = sub.add_parser("control", help="focus, exposure, white balance, zoom, torch")
+    control.add_argument("--focus", choices=["auto", "locked", "manual"])
+    control.add_argument("--lens", type=float, help="lens position 0.0 (near) to 1.0 (far)")
+    control.add_argument("--exposure", choices=["auto", "locked", "manual"])
+    control.add_argument("--shutter", type=float, help="exposure duration in seconds, e.g. 0.008")
+    control.add_argument("--iso", type=float)
+    control.add_argument("--ev", type=float, help="exposure target bias")
+    control.add_argument("--wb", choices=["auto", "locked", "manual"])
+    control.add_argument("--temperature", type=float, help="white balance in Kelvin")
+    control.add_argument("--zoom", type=float)
+    control.add_argument("--torch", choices=["on", "off"])
+    control.add_argument("--torch-level", type=float, help="0.0 to 1.0")
+    control.set_defaults(func=cmd_control)
+
+    sub.add_parser("lock", help="lock focus, exposure and white balance").set_defaults(func=cmd_lock)
+
+    record = sub.add_parser("record", help="start/stop/inspect a recording")
+    record_sub = record.add_subparsers(dest="record_command", required=True)
+
+    start = record_sub.add_parser("start")
+    start.add_argument("--name")
+    start.add_argument("--container", choices=["mov", "mp4"], default="mov")
+    start.add_argument("--max-duration", type=float, help="auto-stop after N seconds")
+    start.set_defaults(func=cmd_record_start)
+
+    record_sub.add_parser("stop").set_defaults(func=cmd_record_stop)
+    record_sub.add_parser("status").set_defaults(func=cmd_record_status)
+
+    clip = sub.add_parser("clip", help="record for N seconds, download, and delete from device")
+    clip.add_argument("seconds", type=float)
+    clip.add_argument("-o", "--output", help="destination path")
+    clip.add_argument("--name")
+    clip.add_argument("--container", choices=["mov", "mp4"], default="mov")
+    clip.add_argument("--keep", action="store_true", help="leave the file on the device")
+    clip.set_defaults(func=cmd_clip)
+
+    files = sub.add_parser("files", help="list, download and delete recordings")
+    files_sub = files.add_subparsers(dest="files_command", required=True)
+
+    files_sub.add_parser("list").set_defaults(func=cmd_files_list)
+
+    pull = files_sub.add_parser("pull", help="download recordings (resumable)")
+    pull.add_argument("id", nargs="?")
+    pull.add_argument("-o", "--output", help="file path, or directory when using --all")
+    pull.add_argument("--all", action="store_true")
+    pull.add_argument("--delete", action="store_true", help="delete from device after a verified download")
+    pull.set_defaults(func=cmd_files_pull)
+
+    remove = files_sub.add_parser("rm")
+    remove.add_argument("id", nargs="?")
+    remove.add_argument("--all", action="store_true")
+    remove.set_defaults(func=cmd_files_rm)
+
+    snapshot = sub.add_parser("snapshot", help="grab a single JPEG")
+    snapshot.add_argument("-o", "--output", default="snapshot.jpg", help="path, or - for stdout")
+    snapshot.add_argument("--max-width", type=int, default=1920)
+    snapshot.add_argument("--quality", type=float, default=0.85)
+    snapshot.set_defaults(func=cmd_snapshot)
+
+    stream = sub.add_parser("stream", help="consume the live MJPEG stream")
+    stream.add_argument("--url", action="store_true", help="just print the stream URL (for ffmpeg/VLC)")
+    stream.add_argument("--outdir", help="write frames as JPEG files here")
+    stream.add_argument("--frames", type=int, help="stop after N frames")
+    stream.add_argument("--fps", type=float)
+    stream.add_argument("--quality", type=float)
+    stream.add_argument("--max-width", type=int)
+    stream.set_defaults(func=cmd_stream)
+
+    events = sub.add_parser("events", help="tail the server-sent event stream")
+    events.add_argument("--include-hello", action="store_true")
+    events.set_defaults(func=cmd_events)
+
+    watch = sub.add_parser("watch", help="live one-line status")
+    watch.add_argument("--interval", type=float, default=1.0)
+    watch.set_defaults(func=cmd_watch)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    cam = CameraAPI(host=args.host, port=args.port, token=args.token)
+    try:
+        args.func(cam, args)
+    except HTTPError as exc:
+        print(f"error: {exc.message} ({exc.code}, HTTP {exc.status})", file=sys.stderr)
+        return 2
+    except CameraAPIError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
