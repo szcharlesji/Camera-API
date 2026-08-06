@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="cable" x1="515" y1="686" x2="728" y2="918" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAFDFF"/>
+      <stop offset="0.48" stop-color="#65E6FF"/>
+      <stop offset="1" stop-color="#7B74FF"/>
+    </linearGradient>
+    <linearGradient id="plug" x1="650" y1="816" x2="796" y2="941" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#C5ECFF"/>
+    </linearGradient>
+  </defs>
+  <path d="M512 690v35c0 87 44 133 127 133h35" fill="none" stroke="#1B235E" stroke-opacity="0.3" stroke-width="62" stroke-linecap="round"/>
+  <path d="M512 690v35c0 87 44 133 127 133h35" fill="none" stroke="url(#cable)" stroke-width="40" stroke-linecap="round"/>
+  <g transform="translate(650 798) rotate(-7 75 76)">
+    <rect x="0" y="24" width="150" height="112" rx="43" fill="url(#plug)"/>
+    <rect x="33" y="0" width="84" height="52" rx="22" fill="#DDF8FF"/>
+    <rect x="47" y="14" width="56" height="23" rx="11.5" fill="#27306E" fill-opacity="0.72"/>
+    <path d="M42 88h66" stroke="#7A86B8" stroke-opacity="0.5" stroke-width="12" stroke-linecap="round"/>
+  </g>
+</svg>
