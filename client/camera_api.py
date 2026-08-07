@@ -537,16 +537,26 @@ class CameraAPI:
         self,
         recording_id: str,
         destination: str,
-        resume: bool = True,
+        resume: bool = False,
         chunk_size: int = 1 << 20,
         progress: Optional[Callable[[int, int], None]] = None,
         timeout: float = 600.0,
+        overlap_bytes: int = 1 << 16,
     ) -> str:
-        """Downloads a recording to ``destination``.
+        """Downloads a recording to ``destination``, overwriting it.
 
-        With ``resume=True`` an interrupted transfer is continued using an HTTP
-        Range request instead of starting over — worth having on a USB link that
-        can be unplugged.
+        ``resume=True`` continues an interrupted transfer with an HTTP Range
+        request instead of starting over — worth having on a USB link that can
+        be unplugged. It defaults to **off** because resuming is only safe when
+        the bytes already on disk really are a prefix of the file being fetched,
+        and a path is a weak promise of that: writing a *different* recording to
+        a path that already holds an older, shorter one would otherwise splice
+        the new tail onto the old body and produce a corrupt file of exactly the
+        expected length, passing every size check.
+
+        So when resuming, the last ``overlap_bytes`` already on disk are
+        re-fetched and compared before anything is appended; on a mismatch the
+        transfer restarts from zero.
 
         ``progress`` is called as ``progress(bytes_done, total_bytes)``.
         """
@@ -556,14 +566,13 @@ class CameraAPI:
         already = 0
         mode = "wb"
         if resume and os.path.exists(destination):
-            already = os.path.getsize(destination)
-            if already == total:
-                if progress:
-                    progress(total, total)
-                return destination
-            if already > total:
-                already = 0
-            else:
+            on_disk = os.path.getsize(destination)
+            if 0 < on_disk <= total and self._is_prefix(recording_id, destination, on_disk, overlap_bytes):
+                if on_disk == total:
+                    if progress:
+                        progress(total, total)
+                    return destination
+                already = on_disk
                 mode = "ab"
 
         headers = {"Range": f"bytes={already}-"} if already else None
@@ -587,6 +596,22 @@ class CameraAPI:
                 f"Download of {recording_id} is short: got {actual} bytes, expected {total}."
             )
         return destination
+
+    def _is_prefix(self, recording_id: str, path: str, length: int, window: int) -> bool:
+        """Is the file at ``path`` genuinely the first ``length`` bytes of this
+        recording? Compares a trailing window rather than the whole file, which
+        is enough to catch a different recording sitting at the same path."""
+        window = min(window, length)
+        if window <= 0:
+            return True
+        with open(path, "rb") as handle:
+            handle.seek(length - window)
+            local = handle.read(window)
+        start = length - window
+        headers = {"Range": f"bytes={start}-{length - 1}"}
+        with self._open("GET", f"/files/{recording_id}/download", extra_headers=headers) as response:
+            remote = response.read(window)
+        return local == remote
 
     def delete(self, recording_id: str) -> dict:
         return self._json("DELETE", f"/files/{recording_id}")
