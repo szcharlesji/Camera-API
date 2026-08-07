@@ -14,6 +14,21 @@ import os
 ///   * `stateLock` guards the small snapshot of state that HTTP handlers read.
 final class CaptureController: NSObject, @unchecked Sendable {
 
+    /// Timebase the movie and its video track are written in.
+    ///
+    /// AVAssetWriter defaults to 600, which quantises every frame's PTS to
+    /// 1.667 ms. That is coarse enough to matter to anyone aligning frames
+    /// against an external signal: it adds a uniform +/-0.83 ms of timestamp
+    /// error, and it makes the sensor's real cadence unrecoverable -- a 60 fps
+    /// clip whose true frame period is a few hundred ppm off nominal has to
+    /// absorb the drift by emitting an occasional 11-tick interval, so the
+    /// measured average frame rate lands visibly below 60.
+    ///
+    /// 60000 is the broadcast-standard choice and is exactly 1000 ticks per
+    /// frame at 60 fps, leaving 16.7 us of quantisation -- a hundredth of the
+    /// default and well below any other term in a capture timing budget.
+    static let movieTimeScale: CMTimeScale = 60_000
+
     // MARK: - Nested types
 
     /// A recording in flight. Confined to `sampleQueue` once installed.
@@ -497,6 +512,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
         } catch {
             throw APIError.internalError("Could not create asset writer: \(error.localizedDescription)")
         }
+        writer.movieTimeScale = Self.movieTimeScale
 
         let width = config.encodedWidth
         let height = config.encodedHeight
@@ -521,6 +537,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
             ]
         )
         videoInput.expectsMediaDataInRealTime = true
+        videoInput.mediaTimeScale = Self.movieTimeScale
 
         guard writer.canAdd(videoInput) else {
             throw APIError.internalError("Asset writer rejected the video input (\(width)x\(height), \(config.codec.rawValue)).")

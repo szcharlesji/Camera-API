@@ -521,8 +521,23 @@ firstVideoPTSSeconds + file_pts[i]
 ```
 
 on the capture clock, which `GET /clock` lets you map onto your own timeline.
-At 60 fps the file's `1/600` timebase divides evenly (10 ticks per frame), so
-stored timestamps carry no quantisation error.
+
+The movie is written with a `1/60000` timebase — 1000 ticks per frame at 60 fps,
+16.7 µs of quantisation. Do not assume a nominal rate divides it evenly and
+therefore costs nothing: a sensor's true frame period is a few hundred ppm off
+its nominal rate, so the stored intervals are *not* all identical, and the drift
+has to land somewhere. Under the old `1/600` default that meant an occasional
+11-tick interval instead of 10 — ±0.83 ms on every timestamp, and a measured
+`avg_frame_rate` visibly below nominal (59.975 for a healthy 60 fps clip). At
+`1/60000` the same drift is absorbed a hundred times more finely.
+
+Two consequences for anyone validating a file:
+
+* Compare a measured `avg_frame_rate` against nominal with a tolerance in the
+  hundreds of ppm, never with an exact match. The device's configured rate is in
+  `GET /status`, and that one *is* exact.
+* Do not gate on ffprobe's `r_frame_rate`. It is a guess at the coarsest timebase
+  that represents every timestamp, and a fine timescale makes it unstable.
 
 ```python
 pts = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
