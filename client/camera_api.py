@@ -156,9 +156,11 @@ class CameraAPI:
             self._url(path, params), data=data, headers=headers, method=method
         )
         try:
-            return self._opener.open(
+            response = self._opener.open(
                 request, timeout=self.timeout if timeout is None else timeout
             )
+            self._assert_is_camera_api(response.headers)
+            return response
         except urllib.error.HTTPError as exc:
             raise self._to_error(exc) from None
         except self._transport_errors as exc:
@@ -182,9 +184,36 @@ class CameraAPI:
             )
         return f"Is the app in the foreground and 'iproxy {self.port}:{self.port}' running?"
 
-    @staticmethod
-    def _to_error(exc: urllib.error.HTTPError) -> CameraAPIError:
+    def _assert_is_camera_api(self, headers) -> None:
+        """Rejects a reply that did not come from CameraAPI.
+
+        Without ``--usbmux`` the client talks to a plain local port, and on a
+        shared machine some unrelated service may already own it. Every
+        CameraAPI response carries a ``Server: CameraAPI/...`` header, so the
+        mismatch is worth naming rather than letting a stranger's HTML error
+        page surface as if the camera had produced it.
+        """
+        server = ""
+        try:
+            server = headers.get("Server") or ""
+        except AttributeError:
+            return
+        if server.startswith("CameraAPI"):
+            return
+        raise CameraAPIError(
+            f"{self.host}:{self.port} is not CameraAPI — it answered as "
+            f"'{server or 'an unidentified server'}'. Another service owns that "
+            f"port. Use usbmux to reach the device without a local port at all "
+            f"(camctl --usbmux, or CAMERA_API_USBMUX=1), or forward to a free "
+            f"one: camctl tunnel 18080:8080 then --port 18080."
+        )
+
+    def _to_error(self, exc: urllib.error.HTTPError) -> CameraAPIError:
         raw = exc.read()
+        try:
+            self._assert_is_camera_api(exc.headers)
+        except CameraAPIError as mismatch:
+            return mismatch
         try:
             payload = json.loads(raw)
             return HTTPError(exc.code, payload.get("error", "error"), payload.get("message", ""))
