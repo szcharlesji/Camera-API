@@ -500,6 +500,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
             AVVideoAverageBitRateKey: config.bitrate,
             AVVideoExpectedSourceFrameRateKey: Int(config.fps.rounded()),
             AVVideoMaxKeyFrameIntervalKey: config.keyFrameInterval,
+            AVVideoAllowFrameReorderingKey: config.allowFrameReordering,
         ]
         if config.codec == .h264 {
             compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
@@ -1142,7 +1143,8 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 rotationDegrees: config.rotationDegrees,
                 stabilization: config.stabilization.rawValue,
                 formatIndex: formatIndex,
-                keyFrameInterval: config.keyFrameInterval
+                keyFrameInterval: config.keyFrameInterval,
+                allowFrameReordering: config.allowFrameReordering
             ),
             lastError: lastError
         )

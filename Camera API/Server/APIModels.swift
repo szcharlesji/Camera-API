@@ -26,6 +26,9 @@ struct ConfigureRequest: Decodable {
     /// whole interval. Training pipelines that sample random subsequences want
     /// something small (10-15), or 1 for all-intra.
     var keyFrameInterval: Int?
+    /// Allow B-frames. Defaults to true. Set false for frame-indexed datasets:
+    /// packet timestamps then come out in presentation order.
+    var allowFrameReordering: Bool?
 }
 
 struct ControlRequest: Decodable {
@@ -236,6 +239,7 @@ struct SessionConfigDTO: Encodable {
     let stabilization: String
     let formatIndex: Int
     let keyFrameInterval: Int
+    let allowFrameReordering: Bool
 }
 
 struct SessionStateDTO: Encodable {

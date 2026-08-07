@@ -526,10 +526,21 @@ stored timestamps carry no quantisation error.
 
 ```python
 pts = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                      "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+                      "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
                      capture_output=True, text=True).stdout.split()
 times = frame_times(recording, pts, sync)      # -> host monotonic seconds
 ```
+
+**Read packets, not frames.** `-show_entries frame=pts_time` looks like the
+obvious choice and quietly returns *one timestamp fewer than the file holds* —
+ffprobe's decoder never flushes its final picture. On a verified 361-frame
+recording it yields 360. Packets give the complete set, and `frame_times` sorts
+them because packets arrive in decode order whenever the stream has B-frames.
+Both mistakes are now rejected with an explicit error rather than silently
+producing a misaligned dataset.
+
+To sidestep decode-order entirely, record with `"allowFrameReordering": false`;
+packet order then equals presentation order.
 
 The three drop counters distinguish causes that need different fixes:
 

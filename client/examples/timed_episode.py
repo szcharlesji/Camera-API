@@ -29,10 +29,16 @@ OUTDIR = sys.argv[2] if len(sys.argv) > 2 else "episodes"
 
 
 def ffprobe_frame_pts(path):
-    """Per-frame presentation times from the file, relative to its own zero."""
+    """Per-frame presentation times from the file, relative to its own zero.
+
+    Reads *packets*, not frames. `-show_entries frame=` decodes, and the decoder
+    does not flush its last picture, so it returns one timestamp fewer than the
+    file holds. Packets carry the complete set; frame_times() sorts them, since
+    packets arrive in decode order when the stream has B-frames.
+    """
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
         capture_output=True, text=True, check=True,
     ).stdout
     return [line for line in out.split() if line and line != "N/A"]
@@ -52,7 +58,8 @@ def main() -> int:
 
     # Short GOP so training can seek to a random frame cheaply.
     status = cam.configure(width=1920, height=1080, fps=60, codec="h264",
-                           audio=False, key_frame_interval=12)
+                           audio=False, key_frame_interval=12,
+                           allow_frame_reordering=False)
     config = status["session"]["config"]
     print(f"configured {config['width']}x{config['height']} @ {config['fps']:g} fps, "
           f"keyframe every {config['keyFrameInterval']} frames")
@@ -111,9 +118,9 @@ def main() -> int:
     print(f"downloaded {os.path.getsize(video) / 1e6:.1f} MB")
 
     file_pts = ffprobe_frame_pts(video)
-    if len(file_pts) not in (meta["framesWritten"], meta["framesWritten"] - 1):
-        print(f"WARNING: ffprobe counted {len(file_pts)} frames, API reported "
-              f"{meta['framesWritten']}", file=sys.stderr)
+    if len(file_pts) != meta["framesWritten"]:
+        print(f"WARNING: the file holds {len(file_pts)} packets but the API reported "
+              f"{meta['framesWritten']} frames", file=sys.stderr)
 
     with open(os.path.join(staging, "timing.json"), "w") as handle:
         json.dump({

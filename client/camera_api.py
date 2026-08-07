@@ -363,6 +363,7 @@ class CameraAPI:
         stabilization: Optional[str] = None,
         format_index: Optional[int] = None,
         key_frame_interval: Optional[int] = None,
+        allow_frame_reordering: Optional[bool] = None,
     ) -> dict:
         """Reconfigures the capture session. Omitted arguments are left alone.
 
@@ -381,6 +382,7 @@ class CameraAPI:
             "stabilization": stabilization,
             "formatIndex": format_index,
             "keyFrameInterval": key_frame_interval,
+            "allowFrameReordering": allow_frame_reordering,
         }
         return self._json("POST", "/configure", body={k: v for k, v in body.items() if v is not None})
 
@@ -665,15 +667,24 @@ def pts_to_local(pts_seconds, sync: dict):
     return [p - offset for p in pts_seconds]
 
 
-def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None):
+def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None, sort: bool = True):
     """Absolute time for every frame of a finished recording.
 
     The written movie always restarts its timeline at zero, so the absolute
-    capture time of frame *i* is ``firstVideoPTSSeconds + file_pts[i]``. Pass
-    ``file_pts_seconds`` from ffprobe::
+    capture time of frame *i* is ``firstVideoPTSSeconds + file_pts[i]``.
+
+    Read the timestamps from **packets**, not frames::
 
         ffprobe -v error -select_streams v:0 \\
-                -show_entries frame=pts_time -of csv=p=0 video.mov
+                -show_entries packet=pts_time -of csv=p=0 video.mov
+
+    `-show_entries frame=...` looks like the obvious choice and is wrong: it
+    decodes, and the decoder does not flush its final picture, so you silently
+    get one fewer timestamp than there are frames. Packets give the complete
+    set — but in *decode* order, which differs from presentation order whenever
+    the encoder emitted B-frames. `sort=True` (the default) restores
+    presentation order; presentation timestamps are monotonic by definition, so
+    sorting cannot reorder anything that was already correct.
 
     Without ``sync`` the result is on the phone's capture clock. With ``sync``
     it is on this machine's monotonic clock, ready to align against telemetry.
@@ -685,8 +696,44 @@ def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None):
             "predating firstVideoPTSSeconds. Re-record to get an alignable file."
         )
     first = timing["firstVideoPTSSeconds"]
-    absolute = [first + float(p) for p in file_pts_seconds]
+    offsets = [_as_seconds(p) for p in file_pts_seconds]
+
+    if sort:
+        offsets.sort()
+    elif any(b < a for a, b in zip(offsets, offsets[1:])):
+        raise CameraAPIError(
+            "Timestamps are not monotonic, which means they are in decode order "
+            "(the stream has B-frames). Pass sort=True, or record with "
+            "allowFrameReordering=false so decode and presentation order match."
+        )
+
+    expected = recording.get("framesWritten")
+    if expected and len(offsets) != expected:
+        raise CameraAPIError(
+            f"Got {len(offsets)} timestamps but the recording holds {expected} "
+            f"frames. Read packets rather than frames: "
+            f"-show_entries packet=pts_time"
+        )
+
+    absolute = [first + value for value in offsets]
     return pts_to_local(absolute, sync) if sync else absolute
+
+
+def _as_seconds(value) -> float:
+    """Parses one ffprobe timestamp.
+
+    `-of csv=p=0` emits a trailing comma per row, and a frame with no timestamp
+    comes through as `N/A`, so raw tokens cannot go straight to float().
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    token = str(value).strip().rstrip(",").strip()
+    if not token or token.upper() == "N/A":
+        raise CameraAPIError(
+            "ffprobe reported a frame with no presentation timestamp; the file "
+            "may be truncated."
+        )
+    return float(token)
 
 
 # --------------------------------------------------------------------- stream parsing

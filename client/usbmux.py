@@ -163,27 +163,58 @@ def list_devices(timeout: float = 10.0) -> list:
     return devices
 
 
-def find_device(udid: Optional[str] = None, timeout: float = 10.0) -> dict:
-    """Picks a device by UDID, or the only attached one."""
+def find_device(
+    udid: Optional[str] = None,
+    timeout: float = 10.0,
+    allow_network: bool = False,
+) -> dict:
+    """Picks the USB-attached device, by UDID or as the only one present.
+
+    A device with Wi-Fi sync enabled is advertised twice — once per connection
+    type — so entries are collapsed per UDID with the USB link preferred. That
+    preference is about correctness, not tidiness: a `Network` entry tunnels
+    over Wi-Fi, whose latency is both higher and far more variable, which would
+    quietly wreck clock synchronisation.
+    """
     devices = list_devices(timeout)
     if not devices:
         raise DeviceNotFound(
             "No iOS device is attached. Check the cable, and that the device is "
             "unlocked and trusts this computer."
         )
-    if udid:
-        for device in devices:
-            if device["udid"] == udid:
-                return device
-        available = ", ".join(str(d["udid"]) for d in devices)
-        raise DeviceNotFound(f"No device with UDID {udid}. Attached: {available}")
 
-    if len(devices) > 1:
-        available = ", ".join(str(d["udid"]) for d in devices)
+    collapsed: dict = {}
+    for device in devices:
+        key = device["udid"]
+        current = collapsed.get(key)
+        if current is None or (
+            current["connection_type"] != "USB" and device["connection_type"] == "USB"
+        ):
+            collapsed[key] = device
+    candidates = list(collapsed.values())
+
+    if udid:
+        chosen = collapsed.get(udid)
+        if chosen is None:
+            available = ", ".join(sorted(collapsed))
+            raise DeviceNotFound(f"No device with UDID {udid}. Attached: {available}")
+    else:
+        if len(candidates) > 1:
+            available = ", ".join(sorted(collapsed))
+            raise DeviceNotFound(
+                f"{len(candidates)} devices attached; pass a UDID to choose one. "
+                f"Attached: {available}"
+            )
+        chosen = candidates[0]
+
+    if chosen["connection_type"] != "USB" and not allow_network:
         raise DeviceNotFound(
-            f"{len(devices)} devices attached; pass a UDID to choose one. Attached: {available}"
+            f"Device {chosen['udid']} is only reachable over Wi-Fi "
+            f"(connection type {chosen['connection_type']}), not USB. Plug in the "
+            f"cable — a Wi-Fi tunnel has variable latency that will corrupt clock "
+            f"synchronisation. Pass allow_network=True to override."
         )
-    return devices[0]
+    return chosen
 
 
 def connect(

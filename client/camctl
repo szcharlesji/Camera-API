@@ -188,6 +188,7 @@ def cmd_configure(cam, args):
         stabilization=args.stabilization,
         format_index=args.format_index,
         key_frame_interval=args.keyframe_interval,
+        allow_frame_reordering=False if args.no_bframes else None,
     )
     if emit(status, args.json):
         return
@@ -557,6 +558,9 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--rotation", type=int, choices=[0, 90, 180, 270])
     configure.add_argument("--stabilization", choices=["off", "standard", "cinematic", "cinematicExtended", "auto"])
     configure.add_argument("--format-index", type=int, help="pin an exact format from `camctl formats`")
+    configure.add_argument("--no-bframes", action="store_true",
+                           help="disable frame reordering so packet timestamps come out in "
+                                "presentation order (simpler frame indexing)")
     configure.add_argument("--keyframe-interval", type=int, metavar="N",
                            help="frames between keyframes (default 2*fps). Small values make random "
                                 "access cheap for training; 1 is all-intra")

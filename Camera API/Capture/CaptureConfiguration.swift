@@ -96,6 +96,10 @@ struct CaptureConfiguration: Sendable, Equatable {
     var formatIndex: Int?
     /// Frames between keyframes. `nil` means "2 x fps".
     var explicitKeyFrameInterval: Int?
+    /// Whether the encoder may emit B-frames. Turning this off makes decode
+    /// order match presentation order, which keeps packet timestamps monotonic
+    /// and makes frame-indexed access simpler, at some cost in compression.
+    var allowFrameReordering: Bool = true
 
     /// Governs how much decoding a random-access seek costs: a seek lands on the
     /// preceding keyframe and decodes forward from there. The 2-second default

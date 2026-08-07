@@ -204,6 +204,9 @@ final class Router: @unchecked Sendable {
             }
             config.explicitKeyFrameInterval = interval
         }
+        if let reordering = body.allowFrameReordering {
+            config.allowFrameReordering = reordering
+        }
         // An explicit format index only applies to this call; leaving it set would
         // silently pin the format across later resolution changes.
         config.formatIndex = body.formatIndex
