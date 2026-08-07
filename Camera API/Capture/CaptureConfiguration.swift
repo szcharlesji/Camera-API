@@ -94,6 +94,16 @@ struct CaptureConfiguration: Sendable, Equatable {
     var stabilization: StabilizationMode = .off
     /// When set, overrides resolution/fps matching and selects a format by index.
     var formatIndex: Int?
+    /// Frames between keyframes. `nil` means "2 x fps".
+    var explicitKeyFrameInterval: Int?
+
+    /// Governs how much decoding a random-access seek costs: a seek lands on the
+    /// preceding keyframe and decodes forward from there. The 2-second default
+    /// suits playback; sampling random subsequences for training wants far less.
+    var keyFrameInterval: Int {
+        if let explicitKeyFrameInterval { return explicitKeyFrameInterval }
+        return max(1, Int(fps.rounded()) * 2)
+    }
 
     var bitrate: Int {
         if let explicitBitrate { return explicitBitrate }

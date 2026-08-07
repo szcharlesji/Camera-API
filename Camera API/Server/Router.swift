@@ -71,6 +71,11 @@ final class Router: @unchecked Sendable {
         case ("GET", "status"):
             return .json(status())
 
+        case ("GET", "clock"):
+            // Deliberately the cheapest handler in the router: every microsecond
+            // spent here widens the uncertainty of the caller's offset estimate.
+            return .json(capture().clockReading())
+
         case ("GET", "cameras"):
             return .json(["cameras": capture().cameraDescriptors()])
 
@@ -192,6 +197,12 @@ final class Router: @unchecked Sendable {
         }
         if let stabilization = body.stabilization {
             config.stabilization = try StabilizationMode.parse(stabilization)
+        }
+        if let interval = body.keyFrameInterval {
+            guard (1...600).contains(interval) else {
+                throw APIError.badRequest("keyFrameInterval must be between 1 (all-intra) and 600 frames.")
+            }
+            config.explicitKeyFrameInterval = interval
         }
         // An explicit format index only applies to this call; leaving it set would
         // silently pin the format across later resolution changes.
@@ -441,11 +452,13 @@ final class Router: @unchecked Sendable {
     DISCOVERY
       GET    /health                      Liveness probe (never requires auth)
       GET    /status                      Full state: device, session, controls, recording, storage
+      GET    /clock                       Capture-clock reading for aligning video PTS to an external timeline
       GET    /cameras                     Available capture devices
       GET    /formats[?camera=<id>]       Every resolution/frame-rate combination a camera supports
 
     CONFIGURATION
-      POST   /configure                   {camera,width,height,fps,codec,bitrate,audio,rotationDegrees,stabilization,formatIndex}
+      POST   /configure                   {camera,width,height,fps,codec,bitrate,audio,rotationDegrees,
+                                           stabilization,formatIndex,keyFrameInterval}
       GET    /controls                    Current focus/exposure/white balance/zoom/torch
       POST   /control                     {focus,exposure,whiteBalance,zoom,torch}
       POST   /stream/settings             {fps,quality,maxWidth}

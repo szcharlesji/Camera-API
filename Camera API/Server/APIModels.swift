@@ -21,6 +21,11 @@ struct ConfigureRequest: Decodable {
     var stabilization: String?
     /// Bypasses resolution/fps matching and selects `formats[index]` directly.
     var formatIndex: Int?
+    /// Frames between keyframes. Defaults to `2 x fps`, which is fine for
+    /// playback but expensive for random access — a seek must decode up to a
+    /// whole interval. Training pipelines that sample random subsequences want
+    /// something small (10-15), or 1 for all-intra.
+    var keyFrameInterval: Int?
 }
 
 struct ControlRequest: Decodable {
@@ -120,6 +125,49 @@ struct Nullable<Wrapped: Encodable>: Encodable {
     }
 }
 
+extension Nullable: Decodable where Wrapped: Decodable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        wrappedValue = container.decodeNil() ? nil : try container.decode(Wrapped.self)
+    }
+}
+
+// MARK: - Clock
+
+/// A reading of the phone's clocks, for aligning video timestamps with an
+/// external timeline (robot telemetry, another sensor, a second device).
+///
+/// Correlate against `captureClockSeconds`: it is the timebase every sample
+/// buffer presentation timestamp is expressed in, and the domain that
+/// `firstVideoPTSSeconds` lives in.
+struct ClockResponseDTO: Encodable {
+    /// `AVCaptureSession.synchronizationClock` — the PTS timebase.
+    let captureClockSeconds: Double
+    let captureClockNanos: Int64
+    /// The system host clock (`mach_absolute_time`) read at the same instant.
+    let hostClockSeconds: Double
+    let hostClockNanos: Int64
+    /// `captureClock - hostClock`. Zero when the capture session is driven by
+    /// the host clock, which is the normal case. A non-zero value means sample
+    /// timestamps are on a different timebase and only `captureClock` is valid
+    /// for correlating with PTS.
+    let captureMinusHostSeconds: Double
+    /// False when no session is running, in which case `captureClock` falls
+    /// back to the host clock.
+    let captureClockAvailable: Bool
+}
+
+/// A capture interruption that overlapped a recording. Any entry here means the
+/// footage has a gap and the episode should be treated as suspect.
+struct InterruptionDTO: Codable {
+    let reason: String
+    let startedAt: Date
+    @Nullable var endedAt: Date?
+    /// Onset on the capture clock, so it can be placed against video PTS.
+    let captureClockSeconds: Double
+    @Nullable var durationSeconds: Double?
+}
+
 struct APIInfoDTO: Encodable {
     let name: String
     let version: String
@@ -187,6 +235,7 @@ struct SessionConfigDTO: Encodable {
     let rotationDegrees: Int
     let stabilization: String
     let formatIndex: Int
+    let keyFrameInterval: Int
 }
 
 struct SessionStateDTO: Encodable {
@@ -217,12 +266,29 @@ struct ControlStateDTO: Encodable {
 struct ActiveRecordingDTO: Encodable {
     let id: String
     let name: String
+    /// Wall clock when the *request* was handled — not when the first frame
+    /// arrived. Use `firstVideoPTSSeconds` for anything timing-critical.
     let startedAt: Date
     let durationSeconds: Double
     let framesWritten: Int
+    /// Total of the three specific counters below.
     let framesDropped: Int
+    /// Frames the capture pipeline discarded before the writer ever saw them —
+    /// the encoder or the sample queue could not keep up.
+    let captureDrops: Int
+    /// Frames skipped because the asset writer input was not ready to accept
+    /// more data.
+    let writerBackpressureDrops: Int
+    /// Frames the writer rejected outright.
+    let appendFailures: Int
     let bytesWritten: Int64
     @Nullable var maxDurationSeconds: Double?
+    /// Presentation timestamp of the first written frame, on the capture clock
+    /// (the same domain as `GET /clock`'s `captureClockSeconds`). Null until the
+    /// first frame lands — watch for the `recording.firstFrame` event.
+    @Nullable var firstVideoPTSSeconds: Double?
+    @Nullable var lastVideoPTSSeconds: Double?
+    let interruptions: [InterruptionDTO]
 }
 
 struct StreamStateDTO: Encodable {
@@ -248,6 +314,31 @@ struct StatusResponseDTO: Encodable {
     let storage: StorageDTO
 }
 
+/// Everything needed to place a finished recording on an external timeline,
+/// plus the evidence needed to judge whether it is trustworthy.
+struct RecordingTimingDTO: Codable {
+    /// Presentation timestamp of the first written frame, on the capture clock
+    /// — the same domain as `GET /clock`'s `captureClockSeconds`.
+    ///
+    /// This is the anchor, and it cannot be recovered from the file: the
+    /// written movie always restarts its timeline at zero. Absolute capture
+    /// time for frame *i* is `firstVideoPTSSeconds + file_pts[i]`.
+    let firstVideoPTSSeconds: Double
+    let lastVideoPTSSeconds: Double
+    /// Frames the capture pipeline discarded before the writer saw them.
+    let captureDrops: Int
+    /// Frames skipped because the writer input was not ready.
+    let writerBackpressureDrops: Int
+    /// Frames the writer rejected outright.
+    let appendFailures: Int
+    /// Frames between keyframes, as requested at record time. Governs how much
+    /// decoding a random-access seek costs.
+    let keyFrameInterval: Int
+    /// Non-empty means the capture was interrupted mid-recording and the
+    /// footage has a gap.
+    let interruptions: [InterruptionDTO]
+}
+
 /// One finished recording on disk.
 struct RecordingDTO: Encodable, Decodable {
     let id: String
@@ -266,6 +357,8 @@ struct RecordingDTO: Encodable, Decodable {
     let framesDropped: Int
     let cameraPosition: String
     let rotationDegrees: Int
+    /// Null for recordings made before timing metadata existed.
+    @Nullable var timing: RecordingTimingDTO?
 
     /// Relative URL the client can GET to fetch the media.
     var downloadPath: String { "/files/\(id)/download" }
@@ -274,6 +367,7 @@ struct RecordingDTO: Encodable, Decodable {
         case id, name, filename, createdAt, durationSeconds, sizeBytes
         case width, height, fps, codec, container, hasAudio
         case framesWritten, framesDropped, cameraPosition, rotationDegrees
+        case timing
         case downloadPath
     }
 
@@ -281,7 +375,8 @@ struct RecordingDTO: Encodable, Decodable {
         id: String, name: String, filename: String, createdAt: Date,
         durationSeconds: Double, sizeBytes: Int64, width: Int, height: Int,
         fps: Double, codec: String, container: String, hasAudio: Bool,
-        framesWritten: Int, framesDropped: Int, cameraPosition: String, rotationDegrees: Int
+        framesWritten: Int, framesDropped: Int, cameraPosition: String, rotationDegrees: Int,
+        timing: RecordingTimingDTO? = nil
     ) {
         self.id = id
         self.name = name
@@ -299,6 +394,7 @@ struct RecordingDTO: Encodable, Decodable {
         self.framesDropped = framesDropped
         self.cameraPosition = cameraPosition
         self.rotationDegrees = rotationDegrees
+        self.timing = timing
     }
 
     /// `downloadPath` is derived, so it is written on encode and ignored on decode.
@@ -320,6 +416,7 @@ struct RecordingDTO: Encodable, Decodable {
         framesDropped = try values.decode(Int.self, forKey: .framesDropped)
         cameraPosition = try values.decode(String.self, forKey: .cameraPosition)
         rotationDegrees = try values.decode(Int.self, forKey: .rotationDegrees)
+        timing = try values.decodeIfPresent(RecordingTimingDTO.self, forKey: .timing)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -340,6 +437,7 @@ struct RecordingDTO: Encodable, Decodable {
         try container.encode(framesDropped, forKey: .framesDropped)
         try container.encode(cameraPosition, forKey: .cameraPosition)
         try container.encode(rotationDegrees, forKey: .rotationDegrees)
+        try container.encode(_timing, forKey: .timing)
         try container.encode(downloadPath, forKey: .downloadPath)
     }
 }

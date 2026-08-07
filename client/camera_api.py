@@ -31,6 +31,8 @@ __all__ = [
     "CameraAPIError",
     "HTTPError",
     "Recording",
+    "pts_to_local",
+    "frame_times",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
 ]
@@ -251,6 +253,101 @@ class CameraAPI:
             time.sleep(interval)
         raise CameraAPIError(f"Camera not ready after {timeout}s ({last_error})")
 
+    # --------------------------------------------------------------------- clock
+
+    def clock(self) -> dict:
+        """One reading of the phone's capture clock.
+
+        ``captureClockSeconds`` is the timebase every video PTS is expressed in.
+        Use :meth:`sync_clock` rather than calling this directly — a single
+        reading carries no information about transport delay.
+        """
+        return self._json("GET", "/clock")
+
+    def sync_clock(
+        self,
+        samples: int = 20,
+        keep_fraction: float = 0.25,
+        settle: float = 0.0,
+    ) -> dict:
+        """Estimate the offset between the phone's capture clock and this host.
+
+        Standard NTP-style estimation: time each round trip, assume the phone
+        read its clock at the midpoint, and keep only the fastest samples —
+        a fast round trip has less room to be asymmetric, which is the error
+        that actually matters.
+
+        Returns a dict whose ``offset`` satisfies::
+
+            local_monotonic ~= capture_clock_pts - offset
+
+        so a frame's PTS maps onto this machine's timeline with
+        :func:`pts_to_local`. ``uncertainty`` is a bound, not a standard
+        deviation: with a best round trip of *r*, an adversarially asymmetric
+        path can hide at most *r/2* of error.
+
+        Repeat this periodically over a long recording. Phone and host crystals
+        drift by tens of ppm, which is milliseconds over minutes; fit a line
+        through several syncs rather than trusting one.
+        """
+        if samples < 1:
+            raise ValueError("samples must be >= 1")
+
+        readings = []
+        available = True
+        for _ in range(samples):
+            before = time.monotonic()
+            reading = self.clock()
+            after = time.monotonic()
+
+            available = available and reading.get("captureClockAvailable", True)
+            rtt = after - before
+            # Best guess at the local time when the phone sampled its clock.
+            local_mid = (before + after) / 2
+            readings.append({
+                "rtt": rtt,
+                "offset": reading["captureClockSeconds"] - local_mid,
+                "local_mid": local_mid,
+                "capture_minus_host": reading.get("captureMinusHostSeconds", 0.0),
+            })
+            if settle:
+                time.sleep(settle)
+
+        readings.sort(key=lambda r: r["rtt"])
+        keep = max(1, int(round(len(readings) * keep_fraction)))
+        best = readings[:keep]
+        offsets = sorted(r["offset"] for r in best)
+        median_offset = offsets[len(offsets) // 2]
+
+        all_rtts = sorted(r["rtt"] for r in readings)
+
+        return {
+            "offset": median_offset,
+            "uncertainty": readings[0]["rtt"] / 2,
+            "offset_spread": offsets[-1] - offsets[0],
+            "best_rtt": all_rtts[0],
+            "median_rtt": all_rtts[len(all_rtts) // 2],
+            "worst_rtt": all_rtts[-1],
+            "samples": len(readings),
+            "kept": keep,
+            # Anchors for computing drift between two syncs.
+            "at_local_monotonic": best[0]["local_mid"],
+            "at_wall_clock": time.time(),
+            "capture_clock_available": available,
+            "capture_minus_host": best[0]["capture_minus_host"],
+        }
+
+    @staticmethod
+    def drift_ppm(first: dict, second: dict) -> float:
+        """Clock drift between two :meth:`sync_clock` results, in ppm.
+
+        Positive means the phone clock runs fast relative to this host.
+        """
+        elapsed = second["at_local_monotonic"] - first["at_local_monotonic"]
+        if elapsed <= 0:
+            raise ValueError("second sync must be later than the first")
+        return (second["offset"] - first["offset"]) / elapsed * 1e6
+
     # --------------------------------------------------------------- configuration
 
     def configure(
@@ -265,6 +362,7 @@ class CameraAPI:
         rotation_degrees: Optional[int] = None,
         stabilization: Optional[str] = None,
         format_index: Optional[int] = None,
+        key_frame_interval: Optional[int] = None,
     ) -> dict:
         """Reconfigures the capture session. Omitted arguments are left alone.
 
@@ -282,6 +380,7 @@ class CameraAPI:
             "rotationDegrees": rotation_degrees,
             "stabilization": stabilization,
             "formatIndex": format_index,
+            "keyFrameInterval": key_frame_interval,
         }
         return self._json("POST", "/configure", body={k: v for k, v in body.items() if v is not None})
 
@@ -549,6 +648,45 @@ class CameraAPI:
         """Rebinds the listener. The current connection will drop."""
         body = {"port": port, "accessMode": access_mode, "authToken": auth_token}
         return self._json("POST", "/server/settings", body={k: v for k, v in body.items() if v is not None})
+
+
+# ------------------------------------------------------------------ time alignment
+
+
+def pts_to_local(pts_seconds, sync: dict):
+    """Map a capture-clock timestamp onto this machine's ``time.monotonic()``.
+
+    ``pts_seconds`` may be a single value or an iterable. ``sync`` is the result
+    of :meth:`CameraAPI.sync_clock`.
+    """
+    offset = sync["offset"]
+    if isinstance(pts_seconds, (int, float)):
+        return pts_seconds - offset
+    return [p - offset for p in pts_seconds]
+
+
+def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None):
+    """Absolute time for every frame of a finished recording.
+
+    The written movie always restarts its timeline at zero, so the absolute
+    capture time of frame *i* is ``firstVideoPTSSeconds + file_pts[i]``. Pass
+    ``file_pts_seconds`` from ffprobe::
+
+        ffprobe -v error -select_streams v:0 \\
+                -show_entries frame=pts_time -of csv=p=0 video.mov
+
+    Without ``sync`` the result is on the phone's capture clock. With ``sync``
+    it is on this machine's monotonic clock, ready to align against telemetry.
+    """
+    timing = recording.get("timing")
+    if not timing:
+        raise CameraAPIError(
+            "This recording has no timing metadata — it was captured by a build "
+            "predating firstVideoPTSSeconds. Re-record to get an alignable file."
+        )
+    first = timing["firstVideoPTSSeconds"]
+    absolute = [first + float(p) for p in file_pts_seconds]
+    return pts_to_local(absolute, sync) if sync else absolute
 
 
 # --------------------------------------------------------------------- stream parsing

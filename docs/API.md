@@ -139,6 +139,70 @@ poll.
 and frame drops begin. `session.interrupted` goes `true` whenever the app leaves
 the foreground.
 
+### `GET /clock`
+
+A reading of the clock that video timestamps live on. Use this to align frames
+with an external timeline — robot telemetry, another sensor, a second device.
+
+```json
+{
+  "captureClockSeconds": 481923.417802541,
+  "captureClockNanos": 481923417802541,
+  "hostClockSeconds": 481923.417802541,
+  "hostClockNanos": 481923417802541,
+  "captureMinusHostSeconds": 0,
+  "captureClockAvailable": true
+}
+```
+
+Correlate against **`captureClockSeconds`**. It reads
+`AVCaptureSession.synchronizationClock`, which the SDK defines as the timebase
+*all* capture output sample timestamps are on — the same domain as
+`firstVideoPTSSeconds`. `hostClockSeconds` is `mach_absolute_time` at the same
+instant; the two normally agree, and `captureMinusHostSeconds` shows it. If they
+ever diverge, only the capture clock is meaningful for PTS.
+
+`captureClockAvailable` is `false` when no session is running, in which case the
+reading falls back to the host clock and should not be used as an anchor.
+
+This is the cheapest handler in the router by design: time spent inside it turns
+directly into uncertainty in your offset estimate.
+
+#### Estimating the offset
+
+One reading tells you nothing — you cannot separate the clock difference from
+the transport delay. Take many, time each round trip, and keep only the fastest:
+a fast round trip has less room to be asymmetric, and asymmetry is the error
+that matters.
+
+```bash
+camctl sync
+```
+
+```python
+sync = cam.sync_clock(samples=20)
+local_time = pts_to_local(some_pts, sync)      # phone PTS -> host monotonic
+```
+
+`sync_clock` returns `offset` (capture clock minus host monotonic) and
+`uncertainty`, which is half the best round trip — a bound on how much
+asymmetry could be hiding, not a standard deviation.
+
+Against a mock with 40% of samples carrying 30 ms of one-way delay, the
+estimator recovered a known offset to **0.33 ms** with a reported uncertainty of
+0.37 ms. Measure it on your own link rather than assuming that figure.
+
+**Re-sync during long recordings.** Phone and host crystals drift by tens of
+ppm — milliseconds over minutes. Sync at the start and end (or periodically) and
+fit a line:
+
+```python
+first = cam.sync_clock()
+# ... record ...
+last = cam.sync_clock()
+print(CameraAPI.drift_ppm(first, last), "ppm")
+```
+
 ### `GET /cameras`
 
 ```json
@@ -227,6 +291,20 @@ format and reports the real values back.
 | `rotationDegrees` | int | `0`, `90`, `180`, `270`. Rotates the buffers, so recordings and the stream agree |
 | `stabilization` | string | `off`, `standard`, `cinematic`, `cinematicExtended`, `auto` |
 | `formatIndex` | int | Bypasses resolution/fps matching; applies to this call only |
+| `keyFrameInterval` | int | Frames between keyframes, 1–600. Defaults to `2 × fps` |
+
+**`keyFrameInterval` matters more than it looks.** The default of two seconds is
+right for playback and wrong for training: a random seek lands on the preceding
+keyframe and decodes forward from there, so at 60 fps a random frame costs up to
+119 extra decodes. If you sample random subsequences, set it low:
+
+```bash
+camctl configure --fps 60 --keyframe-interval 12
+```
+
+`1` gives all-intra — largest files, instant seeks. Expect the bitrate to climb
+sharply as the interval shrinks, since keyframes are far bigger than predicted
+frames.
 
 Returns `409` if a recording is in progress.
 
@@ -420,9 +498,55 @@ Blocks while the file is flushed, then returns the finished recording:
 }
 ```
 
+plus a `timing` object:
+
+```json
+"timing": {
+  "firstVideoPTSSeconds": 4182.351234,
+  "lastVideoPTSSeconds": 4482.334567,
+  "captureDrops": 2,
+  "writerBackpressureDrops": 1,
+  "appendFailures": 0,
+  "keyFrameInterval": 12,
+  "interruptions": []
+}
+```
+
+**`firstVideoPTSSeconds` is the anchor, and it exists nowhere else.** The written
+movie always restarts its timeline at zero (`start_pts=0`), so absolute capture
+time is destroyed in the file. Absolute time for frame *i* is:
+
+```
+firstVideoPTSSeconds + file_pts[i]
+```
+
+on the capture clock, which `GET /clock` lets you map onto your own timeline.
+At 60 fps the file's `1/600` timebase divides evenly (10 ticks per frame), so
+stored timestamps carry no quantisation error.
+
+```python
+pts = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                      "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+                     capture_output=True, text=True).stdout.split()
+times = frame_times(recording, pts, sync)      # -> host monotonic seconds
+```
+
+The three drop counters distinguish causes that need different fixes:
+
+| Counter | Meaning | Usual remedy |
+|---|---|---|
+| `captureDrops` | The pipeline discarded frames before the writer saw them | Lower resolution or frame rate; check `thermalState` |
+| `writerBackpressureDrops` | The encoder could not keep up | Lower the bitrate, or use HEVC |
+| `appendFailures` | The writer rejected a frame outright | Genuine fault — inspect `lastError` |
+
+`framesDropped` is their sum, kept for convenience.
+
+**A non-empty `interruptions` means the footage has a gap** and the episode
+should be treated as suspect — each entry carries the reason, wall-clock onset,
+and `captureClockSeconds` so you can locate it against the video.
+
 Compare `framesWritten` against `durationSeconds × fps` to confirm you actually
-got the frame rate you asked for. `framesDropped` counts buffers the encoder
-could not keep up with.
+got the frame rate you asked for.
 
 `409` if no recording is in progress.
 
@@ -525,8 +649,9 @@ data: {"type":"recording.started","timestamp":"2026-08-06T15:04:11Z","payload":{
 | Event | Payload |
 |---|---|
 | `hello` | Full status document |
-| `recording.started` | The active-recording object |
+| `recording.started` | The active-recording object. Fires when the **request** is handled, before any frame exists — `firstVideoPTSSeconds` is still null |
 | `recording.stopped` | The finished recording object |
+| `recording.firstFrame` | The active-recording object, now with `firstVideoPTSSeconds` set |
 | `recording.autostopped` | `{ "message": "max_duration_reached" }` |
 | `session.interrupted` | `{ "message": "video_device_not_available_in_background" }` |
 | `session.resumed` | `{}` |
@@ -535,6 +660,14 @@ data: {"type":"recording.started","timestamp":"2026-08-06T15:04:11Z","payload":{
 ```bash
 curl -N http://localhost:8080/events
 ```
+
+**Wait for `recording.firstFrame`, not `recording.started`,** if you need to know
+when capture genuinely began. `started` fires as the HTTP request is handled,
+which precedes the first sensor frame by an unbounded amount — session warm-up,
+a pending focus sweep, or an interruption can all sit in between. `firstFrame`
+fires from the capture queue at the instant the anchor is established, and
+carries `firstVideoPTSSeconds`. The `startedAt` field on both is wall clock and
+is *not* suitable for alignment.
 
 Interruption reasons: `video_device_not_available_in_background`,
 `audio_device_in_use_by_another_client`, `video_device_in_use_by_another_client`,

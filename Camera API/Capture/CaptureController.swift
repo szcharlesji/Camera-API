@@ -35,7 +35,13 @@ final class CaptureController: NSObject, @unchecked Sendable {
         var firstPTS: CMTime = .invalid
         var lastPTS: CMTime = .invalid
         var framesWritten = 0
-        var framesDropped = 0
+        var captureDrops = 0
+        var writerBackpressureDrops = 0
+        var appendFailures = 0
+        /// Emitted exactly once, when the first sample establishes the anchor.
+        var firstFrameAnnounced = false
+
+        var framesDropped: Int { captureDrops + writerBackpressureDrops + appendFailures }
 
         init(
             id: String,
@@ -120,6 +126,9 @@ final class CaptureController: NSObject, @unchecked Sendable {
     private var _lastError: String?
     private var _interrupted = false
     private var _interruptionReason: String?
+    /// Interruptions overlapping the current recording. Cleared at start; any
+    /// entry means the footage has a gap.
+    private var _recordingInterruptions: [InterruptionDTO] = []
     private var _activeFormatIndex = -1
 
     /// Fired when recording starts or stops so the UI can refresh promptly.
@@ -490,7 +499,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
         var compression: [String: Any] = [
             AVVideoAverageBitRateKey: config.bitrate,
             AVVideoExpectedSourceFrameRateKey: Int(config.fps.rounded()),
-            AVVideoMaxKeyFrameIntervalKey: max(1, Int(config.fps.rounded()) * 2),
+            AVVideoMaxKeyFrameIntervalKey: config.keyFrameInterval,
         ]
         if config.codec == .h264 {
             compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
@@ -549,6 +558,8 @@ final class CaptureController: NSObject, @unchecked Sendable {
             maxDurationSeconds: maxDurationSeconds
         )
 
+        stateLock.withLock { _recordingInterruptions = [] }
+
         // Hand off under `sampleQueue` so a frame in flight cannot interleave.
         // The emptiness check happens here rather than at the top of the method so
         // two concurrent /record/start calls cannot both install a writer and
@@ -571,8 +582,14 @@ final class CaptureController: NSObject, @unchecked Sendable {
             durationSeconds: 0,
             framesWritten: 0,
             framesDropped: 0,
+            captureDrops: 0,
+            writerBackpressureDrops: 0,
+            appendFailures: 0,
             bytesWritten: 0,
-            maxDurationSeconds: maxDurationSeconds
+            maxDurationSeconds: maxDurationSeconds,
+            firstVideoPTSSeconds: nil,
+            lastVideoPTSSeconds: nil,
+            interruptions: []
         )
         stateLock.withLock { _progress = dto }
         onRecordingChange?(true)
@@ -639,7 +656,16 @@ final class CaptureController: NSObject, @unchecked Sendable {
             framesWritten: recording.framesWritten,
             framesDropped: recording.framesDropped,
             cameraPosition: videoDevice?.position.name ?? "unknown",
-            rotationDegrees: recording.configuration.rotationDegrees
+            rotationDegrees: recording.configuration.rotationDegrees,
+            timing: RecordingTimingDTO(
+                firstVideoPTSSeconds: CMTimeGetSeconds(recording.firstPTS),
+                lastVideoPTSSeconds: CMTimeGetSeconds(recording.lastPTS),
+                captureDrops: recording.captureDrops,
+                writerBackpressureDrops: recording.writerBackpressureDrops,
+                appendFailures: recording.appendFailures,
+                keyFrameInterval: recording.configuration.keyFrameInterval,
+                interruptions: stateLock.withLock { _recordingInterruptions }
+            )
         )
 
         store.save(dto)
@@ -647,6 +673,47 @@ final class CaptureController: NSObject, @unchecked Sendable {
         log.info("recording finished: \(dto.id, privacy: .public) \(dto.framesWritten, privacy: .public) frames, \(size, privacy: .public) bytes")
 
         return dto
+    }
+
+    // MARK: - Clock
+
+    /// Reads the clock that sample buffer timestamps are expressed in.
+    ///
+    /// `AVCaptureSession.synchronizationClock` is the authority here — the SDK
+    /// states that all capture output timestamps are on its timebase. Reading
+    /// `mach_absolute_time()` directly would agree today, but would silently
+    /// diverge if the session were ever driven by another clock.
+    func clockReading() -> ClockResponseDTO {
+        let hostClock = CMClockGetHostTimeClock()
+        let captureClock = session.synchronizationClock
+
+        // Read the two as close together as possible; their difference is
+        // reported so a caller can see any skew rather than assume none.
+        let captureTime = captureClock.map { CMClockGetTime($0) } ?? CMClockGetTime(hostClock)
+        let hostTime = CMClockGetTime(hostClock)
+
+        let captureSeconds = CMTimeGetSeconds(captureTime)
+        let hostSeconds = CMTimeGetSeconds(hostTime)
+
+        return ClockResponseDTO(
+            captureClockSeconds: captureSeconds,
+            captureClockNanos: Self.nanoseconds(captureTime),
+            hostClockSeconds: hostSeconds,
+            hostClockNanos: Self.nanoseconds(hostTime),
+            captureMinusHostSeconds: captureSeconds - hostSeconds,
+            captureClockAvailable: captureClock != nil
+        )
+    }
+
+    private static func nanoseconds(_ time: CMTime) -> Int64 {
+        guard time.isValid else { return 0 }
+        return CMTimeConvertScale(time, timescale: 1_000_000_000, method: .roundHalfAwayFromZero).value
+    }
+
+    /// The capture clock alone, for stamping events.
+    private func captureClockSeconds() -> Double {
+        let clock = session.synchronizationClock ?? CMClockGetHostTimeClock()
+        return CMTimeGetSeconds(CMClockGetTime(clock))
     }
 
     // MARK: - Snapshot
@@ -1074,7 +1141,8 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 audioEnabled: config.audioEnabled && audioDeviceInput != nil,
                 rotationDegrees: config.rotationDegrees,
                 stabilization: config.stabilization.rawValue,
-                formatIndex: formatIndex
+                formatIndex: formatIndex,
+                keyFrameInterval: config.keyFrameInterval
             ),
             lastError: lastError
         )
@@ -1096,9 +1164,22 @@ final class CaptureController: NSObject, @unchecked Sendable {
             guard let self else { return }
             let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
             let reason = Self.interruptionReasonName(raw)
+            let onset = Date()
+            let clock = self.captureClockSeconds()
             self.stateLock.withLock {
                 self._interrupted = true
                 self._interruptionReason = reason
+                // Only log against a live recording; an interruption while idle
+                // says nothing about any episode's footage.
+                if self._progress != nil {
+                    self._recordingInterruptions.append(InterruptionDTO(
+                        reason: reason,
+                        startedAt: onset,
+                        endedAt: nil,
+                        captureClockSeconds: clock,
+                        durationSeconds: nil
+                    ))
+                }
             }
             self.log.notice("session interrupted: \(reason, privacy: .public)")
             self.events.send(
@@ -1109,9 +1190,21 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
         center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil) { [weak self] _ in
             guard let self else { return }
+            let ended = Date()
             self.stateLock.withLock {
                 self._interrupted = false
                 self._interruptionReason = nil
+                // Close the most recent open entry, if this recording saw one.
+                if let index = self._recordingInterruptions.lastIndex(where: { $0.endedAt == nil }) {
+                    let open = self._recordingInterruptions[index]
+                    self._recordingInterruptions[index] = InterruptionDTO(
+                        reason: open.reason,
+                        startedAt: open.startedAt,
+                        endedAt: ended,
+                        captureClockSeconds: open.captureClockSeconds,
+                        durationSeconds: ended.timeIntervalSince(open.startedAt)
+                    )
+                }
             }
             self.log.notice("session interruption ended")
             self.events.send(
@@ -1207,7 +1300,7 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         from connection: AVCaptureConnection
     ) {
         guard output === videoOutput, let recording = activeRecording else { return }
-        recording.framesDropped += 1
+        recording.captureDrops += 1
     }
 
     private func handleVideo(_ sampleBuffer: CMSampleBuffer) {
@@ -1230,7 +1323,19 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
             guard presentationTime.isValid else { return }
             recording.writer.startSession(atSourceTime: presentationTime)
             recording.firstPTS = presentationTime
+            recording.lastPTS = presentationTime
             recording.sessionStarted = true
+
+            // `recording.started` fires when the HTTP request is handled, before
+            // any frame exists. This is the event that carries the timing anchor.
+            if !recording.firstFrameAnnounced {
+                recording.firstFrameAnnounced = true
+                let dto = self.progressDTO(for: recording, bytesWritten: 0)
+                self.events.send(
+                    event: "recording.firstFrame",
+                    payload: EventEnvelope(type: "recording.firstFrame", timestamp: Date(), payload: dto)
+                )
+            }
         }
 
         guard recording.writer.status == .writing else {
@@ -1242,7 +1347,7 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         }
 
         guard recording.videoInput.isReadyForMoreMediaData else {
-            recording.framesDropped += 1
+            recording.writerBackpressureDrops += 1
             return
         }
 
@@ -1257,7 +1362,7 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
                 publishProgress(for: recording)
             }
         } else {
-            recording.framesDropped += 1
+            recording.appendFailures += 1
         }
     }
 
@@ -1273,19 +1378,31 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         _ = audioInput.append(sampleBuffer)
     }
 
-    private func publishProgress(for recording: ActiveRecording) {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: recording.url.path)
-        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-        let dto = ActiveRecordingDTO(
+    /// Builds the in-flight snapshot. `bytesWritten` is passed in because
+    /// stat()-ing the file is the expensive part and not every caller needs it.
+    private func progressDTO(for recording: ActiveRecording, bytesWritten: Int64) -> ActiveRecordingDTO {
+        ActiveRecordingDTO(
             id: recording.id,
             name: recording.name,
             startedAt: recording.startedAt,
             durationSeconds: recording.durationSeconds,
             framesWritten: recording.framesWritten,
             framesDropped: recording.framesDropped,
-            bytesWritten: size,
-            maxDurationSeconds: recording.maxDurationSeconds
+            captureDrops: recording.captureDrops,
+            writerBackpressureDrops: recording.writerBackpressureDrops,
+            appendFailures: recording.appendFailures,
+            bytesWritten: bytesWritten,
+            maxDurationSeconds: recording.maxDurationSeconds,
+            firstVideoPTSSeconds: recording.firstPTS.isValid ? CMTimeGetSeconds(recording.firstPTS) : nil,
+            lastVideoPTSSeconds: recording.lastPTS.isValid ? CMTimeGetSeconds(recording.lastPTS) : nil,
+            interruptions: stateLock.withLock { _recordingInterruptions }
         )
+    }
+
+    private func publishProgress(for recording: ActiveRecording) {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: recording.url.path)
+        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        let dto = progressDTO(for: recording, bytesWritten: size)
         stateLock.withLock { _progress = dto }
     }
 

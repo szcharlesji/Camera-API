@@ -187,6 +187,7 @@ def cmd_configure(cam, args):
         rotation_degrees=args.rotation,
         stabilization=args.stabilization,
         format_index=args.format_index,
+        key_frame_interval=args.keyframe_interval,
     )
     if emit(status, args.json):
         return
@@ -194,6 +195,10 @@ def cmd_configure(cam, args):
     print(f"Applied: {config['width']}x{config['height']} @ {config['fps']:g} fps · {config['codec']} "
           f"{config['bitrate'] / 1e6:.1f} Mbps · rotation {config['rotationDegrees']}° · "
           f"audio {'on' if config['audioEnabled'] else 'off'} (format index {config['formatIndex']})")
+    gop = config.get("keyFrameInterval")
+    if gop:
+        print(f"         keyframe every {gop} frames ({gop / config['fps']:.2f}s) — "
+              f"a random seek decodes up to {gop - 1} frames")
 
 
 def print_controls(state):
@@ -203,6 +208,31 @@ def print_controls(state):
     print(f"wb        {state['whiteBalanceMode']} ({state['temperature']:.0f}K, tint {state['tint']:+.0f})")
     print(f"zoom      {state['zoom']:.2f}x")
     print(f"torch     {'on' if state['torchOn'] else 'off'} (level {state['torchLevel']:.2f})")
+
+
+def cmd_clock(cam, args):
+    reading = cam.clock()
+    if not emit(reading, args.json):
+        print(f"captureClock  {reading['captureClockSeconds']:.9f} s  ({reading['captureClockNanos']} ns)")
+        print(f"hostClock     {reading['hostClockSeconds']:.9f} s")
+        print(f"skew          {reading['captureMinusHostSeconds']:+.9f} s  "
+              f"(capture clock {'available' if reading['captureClockAvailable'] else 'UNAVAILABLE, host fallback'})")
+
+
+def cmd_sync(cam, args):
+    sync = cam.sync_clock(samples=args.samples, keep_fraction=args.keep)
+    if emit(sync, args.json):
+        return
+    print(f"offset        {sync['offset']:+.6f} s   (capture clock minus this host's monotonic clock)")
+    print(f"uncertainty   +/- {sync['uncertainty'] * 1e3:.3f} ms   (half the best round trip)")
+    print(f"rtt           best {sync['best_rtt'] * 1e3:.3f} ms / median {sync['median_rtt'] * 1e3:.3f} ms / "
+          f"worst {sync['worst_rtt'] * 1e3:.3f} ms")
+    print(f"spread        {sync['offset_spread'] * 1e3:.3f} ms across the {sync['kept']} kept of {sync['samples']} samples")
+    if not sync["capture_clock_available"]:
+        print("warning: no capture session running, so this is the host clock, not the PTS timebase")
+    frame_ms = 1000.0 / (cam.status()["session"]["config"]["fps"] or 60)
+    print(f"\nframe period is {frame_ms:.2f} ms, so uncertainty is "
+          f"{sync['uncertainty'] * 1e3 / frame_ms * 100:.1f}% of a frame")
 
 
 def cmd_controls(cam, args):
@@ -504,6 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("health", help="liveness probe").set_defaults(func=cmd_health)
     sub.add_parser("status", help="full device and session status").set_defaults(func=cmd_status)
     sub.add_parser("cameras", help="list capture devices").set_defaults(func=cmd_cameras)
+    sub.add_parser("clock", help="one capture-clock reading").set_defaults(func=cmd_clock)
+
+    sync = sub.add_parser("sync", help="estimate phone-to-host clock offset")
+    sync.add_argument("--samples", type=int, default=20)
+    sync.add_argument("--keep", type=float, default=0.25,
+                      help="fraction of fastest round trips to keep (default 0.25)")
+    sync.set_defaults(func=cmd_sync)
 
     formats = sub.add_parser("formats", help="list supported resolutions and frame rates")
     formats.add_argument("--camera", help="uniqueID, 'back' or 'front'")
@@ -520,6 +557,9 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--rotation", type=int, choices=[0, 90, 180, 270])
     configure.add_argument("--stabilization", choices=["off", "standard", "cinematic", "cinematicExtended", "auto"])
     configure.add_argument("--format-index", type=int, help="pin an exact format from `camctl formats`")
+    configure.add_argument("--keyframe-interval", type=int, metavar="N",
+                           help="frames between keyframes (default 2*fps). Small values make random "
+                                "access cheap for training; 1 is all-intra")
     configure.add_argument("--audio", action="store_true")
     configure.add_argument("--no-audio", action="store_true")
     configure.set_defaults(func=cmd_configure)
