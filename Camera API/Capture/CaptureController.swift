@@ -382,9 +382,14 @@ final class CaptureController: NSObject, @unchecked Sendable {
     private func attachOutputsLocked() {
         guard !outputsAttached else { return }
 
-        videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
+        // Take frames in the sensor's native biplanar YCbCr rather than forcing a
+        // BGRA conversion. BGRA costs 4 bytes per pixel against 1.5, so at
+        // 4K60 or 1080p240 it burned ~2 GB/s of memory bandwidth converting every
+        // frame — and then the encoder converted straight back, since YCbCr is
+        // what H.264 and HEVC actually want. The JPEG path is unaffected:
+        // CIImage reads biplanar buffers directly and only pays for a conversion
+        // when a snapshot or stream client is genuinely connected.
+        videoOutput.videoSettings = nil
         // Never let a slow encoder or stream client grow an unbounded backlog.
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.setSampleBufferDelegate(self, queue: sampleQueue)

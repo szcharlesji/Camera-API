@@ -174,7 +174,7 @@ ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", TAG+="systemd", ENV{SYS
 | `No device found` from `iproxy` | Not paired, or `usbmuxd` is not running | `idevicepair pair`; `systemctl start usbmuxd` |
 | `ERROR: Please accept the trust dialog` | Trust prompt not confirmed | Unlock the phone, tap Trust, re-run `idevicepair pair` |
 | Pairing succeeds then fails later | `usbmuxd` and a running `usbmuxd` from another source both claiming the device | `systemctl stop usbmuxd` and let socket activation handle it |
-| Tunnel opens but `/status` hangs | The app is backgrounded — iOS froze the process | Foreground the app; use Guided Access to stop it happening |
+| Was working, now `Connection refused` on port 8080 | Almost always the app losing foreground. iOS suspends it and Network.framework tears the listener down, so a suspended app is indistinguishable from a crashed one over the wire | Foreground the app; use Guided Access for unattended runs. Only suspect a crash if a report appears in Xcode › Devices › View Device Logs |
 | `503 unavailable`, "No camera is available" | Running in the Simulator, or camera permission denied | Run on hardware; check Settings › Camera API |
 | `400`, "No format … supports 60 fps" | That camera cannot do that rate at that resolution | `camctl formats --min-fps 60` and pick a listed mode |
 | `session.interrupted` events | App backgrounded, camera taken by another app, or thermal pressure | See `interruptionReason`; check `thermalState` in `/status` |
@@ -210,13 +210,33 @@ from zero. Recording and streaming simultaneously costs almost nothing: a
 concurrent 15 fps MJPEG feed delivered 1201 frames while the recording still
 held 59.94 fps.
 
-**4K60 requires HEVC.** H.264 stalls at ~50 fps and the reason is unambiguous
-from the counters: `captureDrops` was 0 and `writerBackpressureDrops` was 15%,
-meaning the sensor delivered every frame and the *encoder* could not keep up.
-It is a hardware encoder limit, not a tuning problem — lengthening the GOP,
-re-enabling B-frames and even halving the bitrate to 25 Mbps all left it at
-50.8 fps. HEVC holds a perfect 60.01 fps and produces a *smaller* file
-(35.7 Mbps versus 50.6):
+### The H.264 encoder has a pixel-rate ceiling
+
+H.264 does not fail at 4K specifically — it fails above roughly **400 megapixels
+per second**, however you arrange those pixels. Configurations with matching
+pixel rates behave identically:
+
+| Config | Pixel rate | H.264 | HEVC |
+|---|---|---|---|
+| 4K**30** | 248.8 Mpix/s | 30.05 fps ✓ | — |
+| 1080p**120** | 248.8 Mpix/s | 119.38 fps ✓ | — |
+| **4K60** | 497.7 Mpix/s | 50.8 fps ✗ (15% lost) | **60.02 fps ✓** |
+| **1080p240** | 497.7 Mpix/s | 189.6 fps ✗ (21% lost) | **238.5 fps ✓** |
+
+Two entirely different resolutions, the same rate, the same outcome — and HEVC
+clears both. This matches Apple's own restriction: in Settings → Camera →
+Formats, choosing "Most Compatible" (H.264) removes the 4K60 and 1080p240
+options, because they require "High Efficiency" (HEVC). The stock Camera app
+records those modes in HEVC too.
+
+It is not a tuning problem. Lengthening the GOP, re-enabling B-frames, and
+halving the bitrate to 25 Mbps all left 4K60 at 50.8 fps. Nor is it a pixel
+format problem: taking frames in the sensor's native YCbCr instead of converting
+every one to BGRA — which cut ~2 GB/s of memory bandwidth at these rates —
+changed throughput by less than 0.2 fps at every setting.
+
+**So above ~400 Mpix/s, use HEVC.** It also produces smaller files
+(35.7 Mbps against 50.6 at 4K60):
 
 ```bash
 ./client/camctl configure --width 3840 --height 2160 --fps 60 --codec hevc
