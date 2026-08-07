@@ -198,23 +198,34 @@ def find_device(
         if chosen is None:
             available = ", ".join(sorted(collapsed))
             raise DeviceNotFound(f"No device with UDID {udid}. Attached: {available}")
-    else:
-        if len(candidates) > 1:
-            available = ", ".join(sorted(collapsed))
-            raise DeviceNotFound(
-                f"{len(candidates)} devices attached; pass a UDID to choose one. "
-                f"Attached: {available}"
-            )
-        chosen = candidates[0]
+        if chosen["connection_type"] != "USB" and not allow_network:
+            raise DeviceNotFound(_wifi_only_message(chosen))
+        return chosen
 
-    if chosen["connection_type"] != "USB" and not allow_network:
+    # Devices merely paired over Wi-Fi are not candidates: only one phone is
+    # actually plugged in, so "2 devices attached" would be a misleading refusal.
+    if not allow_network:
+        cabled = [d for d in candidates if d["connection_type"] == "USB"]
+        if not cabled:
+            raise DeviceNotFound(_wifi_only_message(candidates[0]))
+        candidates = cabled
+
+    if len(candidates) > 1:
+        available = ", ".join(sorted(d["udid"] for d in candidates))
         raise DeviceNotFound(
-            f"Device {chosen['udid']} is only reachable over Wi-Fi "
-            f"(connection type {chosen['connection_type']}), not USB. Plug in the "
-            f"cable — a Wi-Fi tunnel has variable latency that will corrupt clock "
-            f"synchronisation. Pass allow_network=True to override."
+            f"{len(candidates)} devices attached over USB; pass a UDID to choose "
+            f"one. Attached: {available}"
         )
-    return chosen
+    return candidates[0]
+
+
+def _wifi_only_message(device: dict) -> str:
+    return (
+        f"Device {device['udid']} is only reachable over Wi-Fi (connection type "
+        f"{device['connection_type']}), not USB. Plug in the cable — a Wi-Fi tunnel "
+        f"has variable latency that will corrupt clock synchronisation. Pass "
+        f"allow_network=True to override."
+    )
 
 
 def connect(

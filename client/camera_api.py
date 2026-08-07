@@ -430,11 +430,29 @@ class CameraAPI:
         freezing immediately can pin a blurry or badly-metered frame.
         """
         mode = "single" if converge else "locked"
-        return self.control(
-            focus={"mode": mode},
-            exposure={"mode": mode},
-            white_balance={"mode": mode},
-        )
+        try:
+            return self.control(
+                focus={"mode": mode},
+                exposure={"mode": mode},
+                white_balance={"mode": mode},
+            )
+        except HTTPError as exc:
+            if not converge or exc.status != 400:
+                raise
+
+        # Not every camera offers a one-shot pass for every subsystem — this
+        # phone has no single-shot white balance, for instance. Apply them
+        # separately so the ones that can converge still do, and fall back to
+        # locking at the current value for the ones that cannot. Note the failed
+        # combined call may already have applied the earlier groups; re-applying
+        # them here is harmless.
+        result = None
+        for group in ("focus", "exposure", "white_balance"):
+            try:
+                result = self.control(**{group: {"mode": "single"}})
+            except HTTPError:
+                result = self.control(**{group: {"mode": "locked"}})
+        return result
 
     def set_stream_settings(
         self,
