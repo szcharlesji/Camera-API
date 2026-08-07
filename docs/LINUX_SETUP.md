@@ -192,6 +192,45 @@ sudo usermod -aG plugdev $USER
 
 Log out and back in.
 
+## Measured performance
+
+iPhone 13 Pro, iOS 26.5.2, starting from `thermalState: nominal` with ample free
+storage. Drop counts are split by cause, which is what makes these diagnosable.
+
+| Mode | Effective fps | Dropped | Cause | Thermal |
+|---|---|---|---|---|
+| **1080p60 h264, 5 minutes** | **59.97** (99.95%) | **2 of 18,008** (0.011%) | capture | `nominal` throughout |
+| 1080p60 h264 + live MJPEG stream | 59.94 (99.90%) | 3 (0.056%) | capture | `nominal` |
+| 4K60 **h264** | 50.6 (84.3%) | **15.7%** | writer backpressure | `nominal` → `fair` |
+| 4K60 **hevc** | **60.01** (100%) | **0** | — | `nominal` |
+
+**1080p60 is effectively lossless** — two dropped frames in five minutes, frame
+spacing 16.675 ms against an ideal 16.667, and clock drift indistinguishable
+from zero. Recording and streaming simultaneously costs almost nothing: a
+concurrent 15 fps MJPEG feed delivered 1201 frames while the recording still
+held 59.94 fps.
+
+**4K60 requires HEVC.** H.264 stalls at ~50 fps and the reason is unambiguous
+from the counters: `captureDrops` was 0 and `writerBackpressureDrops` was 15%,
+meaning the sensor delivered every frame and the *encoder* could not keep up.
+It is a hardware encoder limit, not a tuning problem — lengthening the GOP,
+re-enabling B-frames and even halving the bitrate to 25 Mbps all left it at
+50.8 fps. HEVC holds a perfect 60.01 fps and produces a *smaller* file
+(35.7 Mbps versus 50.6):
+
+```bash
+./client/camctl configure --width 3840 --height 2160 --fps 60 --codec hevc
+```
+
+If a recording comes back short, read the split counters before changing
+anything:
+
+| Dominant counter | Meaning | Fix |
+|---|---|---|
+| `writerBackpressureDrops` | Encoder cannot keep up | Switch to HEVC, or lower resolution |
+| `captureDrops` | Sensor pipeline stalling | Check `thermalState`; let the phone cool |
+| `appendFailures` | Writer rejecting frames | A real fault — check `lastError` |
+
 ## Throughput expectations
 
 Measured through `usbmuxd` on a USB-C iPhone: **40.8 MB/s** pulling a 167 MB
