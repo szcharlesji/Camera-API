@@ -1,10 +1,10 @@
-"""Python client for the CameraAPI iPhone app.
+"""Python client for the AnyCamera iPhone app.
 
 Standard library only — no pip install required on the Linux host.
 
-    from camera_api import CameraAPI
+    from anycamera import AnyCamera
 
-    cam = CameraAPI()                       # 127.0.0.1:8080, i.e. through iproxy
+    cam = AnyCamera()                       # 127.0.0.1:8080, i.e. through iproxy
     cam.configure(width=1280, height=720, fps=60)
     with cam.record(name="take1") as rec:
         time.sleep(5)
@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
 __all__ = [
-    "CameraAPI",
-    "CameraAPIError",
+    "AnyCamera",
+    "AnyCameraError",
     "HTTPError",
     "Recording",
     "pts_to_local",
@@ -41,11 +41,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 
 
-class CameraAPIError(RuntimeError):
+class AnyCameraError(RuntimeError):
     """Base class for every error this client raises."""
 
 
-class HTTPError(CameraAPIError):
+class HTTPError(AnyCameraError):
     """The API returned a non-2xx status.
 
     ``code`` and ``message`` come from the server's JSON error body when present,
@@ -61,7 +61,7 @@ class HTTPError(CameraAPIError):
 
 @dataclass
 class Recording:
-    """Handle returned by :meth:`CameraAPI.record`.
+    """Handle returned by :meth:`AnyCamera.record`.
 
     ``result`` is populated with the finished recording's metadata when the
     context manager exits.
@@ -73,8 +73,8 @@ class Recording:
     result: Optional[dict] = None
 
 
-class CameraAPI:
-    """A connection to one iPhone running the CameraAPI app."""
+class AnyCamera:
+    """A connection to one iPhone running the AnyCamera app."""
 
     def __init__(
         self,
@@ -97,10 +97,10 @@ class CameraAPI:
         """
         self.host = host
         self.port = port
-        self.token = token or os.environ.get("CAMERA_API_TOKEN") or None
+        self.token = token or os.environ.get("ANYCAMERA_TOKEN") or None
         self.timeout = timeout
-        self.usbmux = usbmux or os.environ.get("CAMERA_API_USBMUX") in ("1", "true", "yes")
-        self.udid = udid or os.environ.get("CAMERA_API_UDID") or None
+        self.usbmux = usbmux or os.environ.get("ANYCAMERA_USBMUX") in ("1", "true", "yes")
+        self.udid = udid or os.environ.get("ANYCAMERA_UDID") or None
 
         if self.usbmux:
             from usbmux import UsbmuxError, UsbmuxHTTPHandler
@@ -159,16 +159,16 @@ class CameraAPI:
             response = self._opener.open(
                 request, timeout=self.timeout if timeout is None else timeout
             )
-            self._assert_is_camera_api(response.headers)
+            self._assert_is_anycamera(response.headers)
             return response
         except urllib.error.HTTPError as exc:
             raise self._to_error(exc) from None
         except self._transport_errors as exc:
-            raise CameraAPIError(str(exc)) from None
+            raise AnyCameraError(str(exc)) from None
         except urllib.error.URLError as exc:
-            raise CameraAPIError(f"Could not reach {self.base_url}: {exc.reason}. {self._hint()}") from None
+            raise AnyCameraError(f"Could not reach {self.base_url}: {exc.reason}. {self._hint()}") from None
         except socket.timeout:
-            raise CameraAPIError(f"Request to {path} timed out after {timeout or self.timeout}s") from None
+            raise AnyCameraError(f"Request to {path} timed out after {timeout or self.timeout}s") from None
 
     def _hint(self) -> str:
         """Names the most likely cause of a connection failure."""
@@ -180,16 +180,16 @@ class CameraAPI:
             return (
                 f"No listener on {self.host}:{self.port}, but usbmuxd is running. "
                 f"Either start 'iproxy {self.port}:{self.port}', or skip it entirely "
-                f"with CameraAPI(usbmux=True) / camctl --usbmux."
+                f"with AnyCamera(usbmux=True) / camctl --usbmux."
             )
         return f"Is the app in the foreground and 'iproxy {self.port}:{self.port}' running?"
 
-    def _assert_is_camera_api(self, headers) -> None:
-        """Rejects a reply that did not come from CameraAPI.
+    def _assert_is_anycamera(self, headers) -> None:
+        """Rejects a reply that did not come from AnyCamera.
 
         Without ``--usbmux`` the client talks to a plain local port, and on a
         shared machine some unrelated service may already own it. Every
-        CameraAPI response carries a ``Server: CameraAPI/...`` header, so the
+        AnyCamera response carries a ``Server: AnyCamera/...`` header, so the
         mismatch is worth naming rather than letting a stranger's HTML error
         page surface as if the camera had produced it.
         """
@@ -198,21 +198,21 @@ class CameraAPI:
             server = headers.get("Server") or ""
         except AttributeError:
             return
-        if server.startswith("CameraAPI"):
+        if server.startswith("AnyCamera"):
             return
-        raise CameraAPIError(
-            f"{self.host}:{self.port} is not CameraAPI — it answered as "
+        raise AnyCameraError(
+            f"{self.host}:{self.port} is not AnyCamera — it answered as "
             f"'{server or 'an unidentified server'}'. Another service owns that "
             f"port. Use usbmux to reach the device without a local port at all "
-            f"(camctl --usbmux, or CAMERA_API_USBMUX=1), or forward to a free "
+            f"(camctl --usbmux, or ANYCAMERA_USBMUX=1), or forward to a free "
             f"one: camctl tunnel 18080:8080 then --port 18080."
         )
 
-    def _to_error(self, exc: urllib.error.HTTPError) -> CameraAPIError:
+    def _to_error(self, exc: urllib.error.HTTPError) -> AnyCameraError:
         raw = exc.read()
         try:
-            self._assert_is_camera_api(exc.headers)
-        except CameraAPIError as mismatch:
+            self._assert_is_anycamera(exc.headers)
+        except AnyCameraError as mismatch:
             return mismatch
         try:
             payload = json.loads(raw)
@@ -274,13 +274,13 @@ class CameraAPI:
                 status = self.status()
                 if status["session"]["running"]:
                     return status
-                last_error = CameraAPIError(
+                last_error = AnyCameraError(
                     "Session not running: " + str(status["session"].get("lastError") or "unknown")
                 )
-            except CameraAPIError as exc:
+            except AnyCameraError as exc:
                 last_error = exc
             time.sleep(interval)
-        raise CameraAPIError(f"Camera not ready after {timeout}s ({last_error})")
+        raise AnyCameraError(f"Camera not ready after {timeout}s ({last_error})")
 
     # --------------------------------------------------------------------- clock
 
@@ -621,7 +621,7 @@ class CameraAPI:
 
         actual = os.path.getsize(destination)
         if actual != total:
-            raise CameraAPIError(
+            raise AnyCameraError(
                 f"Download of {recording_id} is short: got {actual} bytes, expected {total}."
             )
         return destination
@@ -731,7 +731,7 @@ def pts_to_local(pts_seconds, sync: dict):
     """Map a capture-clock timestamp onto this machine's ``time.monotonic()``.
 
     ``pts_seconds`` may be a single value or an iterable. ``sync`` is the result
-    of :meth:`CameraAPI.sync_clock`.
+    of :meth:`AnyCamera.sync_clock`.
     """
     offset = sync["offset"]
     if isinstance(pts_seconds, (int, float)):
@@ -763,7 +763,7 @@ def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None, 
     """
     timing = recording.get("timing")
     if not timing:
-        raise CameraAPIError(
+        raise AnyCameraError(
             "This recording has no timing metadata — it was captured by a build "
             "predating firstVideoPTSSeconds. Re-record to get an alignable file."
         )
@@ -773,7 +773,7 @@ def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None, 
     if sort:
         offsets.sort()
     elif any(b < a for a, b in zip(offsets, offsets[1:])):
-        raise CameraAPIError(
+        raise AnyCameraError(
             "Timestamps are not monotonic, which means they are in decode order "
             "(the stream has B-frames). Pass sort=True, or record with "
             "allowFrameReordering=false so decode and presentation order match."
@@ -781,7 +781,7 @@ def frame_times(recording: dict, file_pts_seconds, sync: Optional[dict] = None, 
 
     expected = recording.get("framesWritten")
     if expected and len(offsets) != expected:
-        raise CameraAPIError(
+        raise AnyCameraError(
             f"Got {len(offsets)} timestamps but the recording holds {expected} "
             f"frames. Read packets rather than frames: "
             f"-show_entries packet=pts_time"
@@ -801,7 +801,7 @@ def _as_seconds(value) -> float:
         return float(value)
     token = str(value).strip().rstrip(",").strip()
     if not token or token.upper() == "N/A":
-        raise CameraAPIError(
+        raise AnyCameraError(
             "ffprobe reported a frame with no presentation timestamp; the file "
             "may be truncated."
         )
@@ -844,7 +844,7 @@ def _iter_multipart_jpeg(stream) -> Iterator[bytes]:
 
         if length is None:
             # Without a length there is no safe way to find the payload end.
-            raise CameraAPIError("MJPEG part is missing Content-Length")
+            raise AnyCameraError("MJPEG part is missing Content-Length")
 
         payload = bytearray()
         while len(payload) < length:

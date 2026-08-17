@@ -1,4 +1,4 @@
-# CameraAPI HTTP reference
+# AnyCamera HTTP reference
 
 Base URL through a USB tunnel: `http://127.0.0.1:8080`
 
@@ -62,7 +62,7 @@ HTTP/1.1 with keep-alive and request pipelining. Request bodies must use
 Liveness probe. Never requires a token — safe for a supervisor loop.
 
 ```json
-{ "ok": true, "message": "CameraAPI 1.0.0" }
+{ "ok": true, "message": "AnyCamera 1.0.0" }
 ```
 
 ### `GET /status`
@@ -73,7 +73,7 @@ poll.
 ```json
 {
   "api": {
-    "name": "CameraAPI",
+    "name": "AnyCamera",
     "version": "1.0.0",
     "uptimeSeconds": 412.8,
     "port": 8080,
@@ -200,7 +200,7 @@ fit a line:
 first = cam.sync_clock()
 # ... record ...
 last = cam.sync_clock()
-print(CameraAPI.drift_ppm(first, last), "ppm")
+print(AnyCamera.drift_ppm(first, last), "ppm")
 ```
 
 ### `GET /cameras`
@@ -352,7 +352,7 @@ full range.
 
 > For repeatable capture, lock all three of focus, exposure and white balance
 > before the first take. Otherwise the camera re-meters between takes and your
-> footage will not match. `camctl lock` and `CameraAPI.lock_everything()` do this
+> footage will not match. `camctl lock` and `AnyCamera.lock_everything()` do this
 > in one call.
 
 #### How focus behaves
@@ -641,10 +641,10 @@ frame arrives within `timeout`.
 
 ### `GET /stream.mjpeg`
 
-`multipart/x-mixed-replace; boundary=cameraapiframe` — an endless sequence of:
+`multipart/x-mixed-replace; boundary=anycameraframe` — an endless sequence of:
 
 ```
---cameraapiframe
+--anycameraframe
 Content-Type: image/jpeg
 Content-Length: 24196
 

@@ -1,4 +1,4 @@
-# CameraAPI
+# AnyCamera
 
 Turn an iPhone into a programmable camera you drive from a Linux machine over USB.
 
@@ -17,7 +17,7 @@ your script ──HTTP──> localhost:8080
                            │
                       ═══ USB ═══>  127.0.0.1:8080
                                          │
-                                   NWListener (CameraAPI.app)
+                                   NWListener (AnyCamera.app)
                                          │
                               AVCaptureSession → AVAssetWriter
 ```
@@ -43,7 +43,7 @@ and pull the full-quality file when the take is done.
 
 ### 1. Install the app on the iPhone
 
-Open `Camera API.xcodeproj` in Xcode, select your device, set your signing team,
+Open `AnyCamera.xcodeproj` in Xcode, select your device, set your signing team,
 and run. Grant camera access when prompted.
 
 The app must stay in the **foreground** — iOS suspends `AVCaptureSession` in the
@@ -119,9 +119,9 @@ Standard library only — nothing to `pip install`.
 ```python
 import sys, time
 sys.path.insert(0, "client")
-from camera_api import CameraAPI
+from anycamera import AnyCamera
 
-cam = CameraAPI()                      # 127.0.0.1:8080 through iproxy
+cam = AnyCamera()                      # 127.0.0.1:8080 through iproxy
 cam.wait_until_ready()
 
 cam.configure(width=1280, height=720, fps=60, codec="h264")
@@ -184,7 +184,7 @@ curl -X POST http://localhost:8080/server/settings \
   -d '{"accessMode":"network","authToken":"some-long-random-string"}'
 ```
 
-Then pass `--token` to `camctl`, or set `CAMERA_API_TOKEN`.
+Then pass `--token` to `camctl`, or set `ANYCAMERA_TOKEN`.
 
 ## Keeping it running
 
@@ -204,12 +204,12 @@ for a year. Budget for reinstalling.
 ## Project layout
 
 ```
-Camera API/
+AnyCamera/
   App/          SwiftUI dashboard, app wiring, live preview
   Capture/      AVCaptureSession, AVAssetWriter recording, format selection, JPEG encoding
   Server/       HTTP/1.1 server on NWListener, routing, MJPEG and SSE broadcasters
 client/
-  camera_api.py Python client library (stdlib only)
+  anycamera.py  Python client library (stdlib only)
   usbmux.py     usbmux protocol in pure Python — replaces iproxy, needs no root
   camctl        Command line interface
   examples/     Runnable examples

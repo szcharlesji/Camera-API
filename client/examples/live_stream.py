@@ -14,13 +14,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from camera_api import CameraAPI  # noqa: E402
+from anycamera import AnyCamera  # noqa: E402
 
 SHOW = "--show" in sys.argv
 
 
 def main() -> int:
-    cam = CameraAPI()
+    cam = AnyCamera()
     cam.wait_until_ready()
 
     display = None

@@ -22,7 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from camera_api import CameraAPI, frame_times  # noqa: E402
+from anycamera import AnyCamera, frame_times  # noqa: E402
 
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 10.0
 OUTDIR = sys.argv[2] if len(sys.argv) > 2 else "episodes"
@@ -53,7 +53,7 @@ def sha256(path):
 
 
 def main() -> int:
-    cam = CameraAPI(usbmux=True, timeout=120)
+    cam = AnyCamera(usbmux=True, timeout=120)
     cam.wait_until_ready()
 
     # Short GOP so training can seek to a random frame cheaply.
@@ -101,7 +101,7 @@ def main() -> int:
     print(f"captured {meta['durationSeconds']:.3f}s, {meta['framesWritten']} frames, "
           f"{drops} dropped ({timing['captureDrops']} capture / "
           f"{timing['writerBackpressureDrops']} backpressure / {timing['appendFailures']} append)")
-    print(f"drift {CameraAPI.drift_ppm(sync_before, sync_after):+.1f} ppm over the episode")
+    print(f"drift {AnyCamera.drift_ppm(sync_before, sync_after):+.1f} ppm over the episode")
 
     if timing["interruptions"]:
         print(f"WARNING: {len(timing['interruptions'])} interruption(s) — footage has gaps:")
@@ -127,7 +127,7 @@ def main() -> int:
             "recording": meta,
             "clock_sync_before": sync_before,
             "clock_sync_after": sync_after,
-            "drift_ppm": CameraAPI.drift_ppm(sync_before, sync_after),
+            "drift_ppm": AnyCamera.drift_ppm(sync_before, sync_after),
             "frame_pts_capture_clock": frame_times(meta, file_pts),
             "frame_time_local": frame_times(meta, file_pts, sync_before),
         }, handle, indent=2)

@@ -12,11 +12,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from camera_api import CameraAPI  # noqa: E402
+from anycamera import AnyCamera  # noqa: E402
 
 
 def main() -> int:
-    cam = CameraAPI()
+    cam = AnyCamera()
 
     print(f"Connecting to {cam.base_url}/events — Ctrl-C to stop.")
     try:

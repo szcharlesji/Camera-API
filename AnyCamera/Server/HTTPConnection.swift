@@ -35,7 +35,7 @@ final class HTTPConnection: HTTPResponseWriter, @unchecked Sendable {
         self.router = router
         self.log = log
         self.onFinished = onFinished
-        self.queue = DispatchQueue(label: "cameraapi.connection.\(UUID().uuidString.prefix(8))")
+        self.queue = DispatchQueue(label: "anycamera.connection.\(UUID().uuidString.prefix(8))")
     }
 
     func start() {
@@ -143,7 +143,7 @@ final class HTTPConnection: HTTPResponseWriter, @unchecked Sendable {
 
     private func write(response: HTTPResponse, keepAlive: Bool, isHeadRequest: Bool = false) {
         var headers = response.headers
-        headers["Server"] = "CameraAPI/\(ServerInfo.version)"
+        headers["Server"] = "AnyCamera/\(ServerInfo.version)"
         headers["Date"] = Self.httpDate()
 
         switch response.body {

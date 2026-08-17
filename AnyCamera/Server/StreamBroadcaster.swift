@@ -102,7 +102,7 @@ class StreamBroadcaster: @unchecked Sendable {
 /// Emits `multipart/x-mixed-replace`, the format ffmpeg, OpenCV, VLC and browsers
 /// all consume without any client-side code.
 final class MJPEGBroadcaster: StreamBroadcaster, @unchecked Sendable {
-    static let boundary = "cameraapiframe"
+    static let boundary = "anycameraframe"
 
     static var contentType: String {
         "multipart/x-mixed-replace; boundary=\(boundary)"

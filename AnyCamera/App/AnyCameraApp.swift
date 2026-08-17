@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct CameraAPIApp: App {
+struct AnyCameraApp: App {
     @State private var services = AppServices()
     @Environment(\.scenePhase) private var scenePhase
 

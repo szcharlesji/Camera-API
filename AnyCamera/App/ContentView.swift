@@ -51,7 +51,7 @@ struct ContentView: View {
                         .font(.largeTitle)
                     Text("Camera access not granted")
                         .font(.callout.weight(.medium))
-                    Text("Enable it in Settings › Camera API, then relaunch.")
+                    Text("Enable it in Settings › AnyCamera, then relaunch.")
                         .font(.caption)
                         .multilineTextAlignment(.center)
                 }

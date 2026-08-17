@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""camctl — command line control for the CameraAPI iPhone app.
+"""camctl — command line control for the AnyCamera iPhone app.
 
     camctl status
     camctl formats --min-fps 60
@@ -21,7 +21,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from camera_api import CameraAPI, CameraAPIError, HTTPError  # noqa: E402
+from anycamera import AnyCamera, AnyCameraError, HTTPError  # noqa: E402
 
 
 # ------------------------------------------------------------------ formatting
@@ -112,7 +112,7 @@ def cmd_status(cam, args):
     # omitted them entirely rather than emitting null.
     battery = device.get("batteryLevel")
 
-    print(f"CameraAPI {api['version']}  ·  up {api['uptimeSeconds']:.0f}s  ·  port {api['port']} ({api['accessMode']})")
+    print(f"AnyCamera {api['version']}  ·  up {api['uptimeSeconds']:.0f}s  ·  port {api['port']} ({api['accessMode']})")
     print(f"Device    {device['name']} · iOS {device['systemVersion']} · thermal {device['thermalState']}"
           + (f" · battery {battery * 100:.0f}% ({device['batteryState']})" if battery is not None else ""))
     print(f"Session   {'running' if session['running'] else 'STOPPED'}"
@@ -509,17 +509,17 @@ def cmd_watch(cam, args):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="camctl",
-        description="Control an iPhone running the CameraAPI app over USB.",
+        description="Control an iPhone running the AnyCamera app over USB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Start the tunnel first:  iproxy 8080:8080 &",
     )
-    parser.add_argument("--host", default=os.environ.get("CAMERA_API_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("CAMERA_API_PORT", "8080")))
-    parser.add_argument("--token", default=os.environ.get("CAMERA_API_TOKEN"))
+    parser.add_argument("--host", default=os.environ.get("ANYCAMERA_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("ANYCAMERA_PORT", "8080")))
+    parser.add_argument("--token", default=os.environ.get("ANYCAMERA_TOKEN"))
     parser.add_argument("--json", action="store_true", help="emit raw JSON")
     parser.add_argument("--usbmux", action="store_true",
                         help="tunnel through usbmuxd directly — no iproxy, no root")
-    parser.add_argument("--udid", default=os.environ.get("CAMERA_API_UDID"),
+    parser.add_argument("--udid", default=os.environ.get("ANYCAMERA_UDID"),
                         help="pick a device when several are attached")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -655,19 +655,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    cam = CameraAPI(host=args.host, port=args.port, token=args.token,
+    cam = AnyCamera(host=args.host, port=args.port, token=args.token,
                     usbmux=args.usbmux, udid=args.udid)
     try:
         args.func(cam, args)
     except HTTPError as exc:
         print(f"error: {exc.message} ({exc.code}, HTTP {exc.status})", file=sys.stderr)
         return 2
-    except CameraAPIError as exc:
+    except AnyCameraError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except RuntimeError as exc:
         # usbmux errors reached via `camctl devices` / `tunnel`, which bypass
-        # CameraAPI's transport wrapping.
+        # AnyCamera's transport wrapping.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except BrokenPipeError:

@@ -74,11 +74,11 @@ implements in pure Python. Nothing to install, no root:
 ```
 
 ```python
-from camera_api import CameraAPI
-cam = CameraAPI(usbmux=True)          # no local port, no iproxy
+from anycamera import AnyCamera
+cam = AnyCamera(usbmux=True)          # no local port, no iproxy
 ```
 
-Set `CAMERA_API_USBMUX=1` to make it the default for every invocation.
+Set `ANYCAMERA_USBMUX=1` to make it the default for every invocation.
 
 For tools that need a real TCP endpoint — ffmpeg, VLC, OpenCV — run the built-in
 forwarder instead of `iproxy`. It is a drop-in equivalent:
@@ -124,7 +124,7 @@ curl -s http://localhost:8080/health
 ```
 
 ```json
-{ "message": "CameraAPI 1.0.0", "ok": true }
+{ "message": "AnyCamera 1.0.0", "ok": true }
 ```
 
 If that answers, everything downstream will work.
@@ -136,7 +136,7 @@ If that answers, everything downstream will work.
 ```ini
 # /etc/systemd/system/iproxy-camera.service
 [Unit]
-Description=USB tunnel to CameraAPI iPhone
+Description=USB tunnel to AnyCamera iPhone
 After=usbmuxd.service
 Wants=usbmuxd.service
 
@@ -160,7 +160,7 @@ brings it straight back when the cable returns.
 To start it only when a specific iPhone appears, a udev rule is cleaner:
 
 ```
-# /etc/udev/rules.d/99-cameraapi.rules
+# /etc/udev/rules.d/99-anycamera.rules
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", TAG+="systemd", ENV{SYSTEMD_WANTS}="iproxy-camera.service"
 ```
 
@@ -175,7 +175,7 @@ ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", TAG+="systemd", ENV{SYS
 | `ERROR: Please accept the trust dialog` | Trust prompt not confirmed | Unlock the phone, tap Trust, re-run `idevicepair pair` |
 | Pairing succeeds then fails later | `usbmuxd` and a running `usbmuxd` from another source both claiming the device | `systemctl stop usbmuxd` and let socket activation handle it |
 | Was working, now `Connection refused` on port 8080 | Almost always the app losing foreground. iOS suspends it and Network.framework tears the listener down, so a suspended app is indistinguishable from a crashed one over the wire | Foreground the app; use Guided Access for unattended runs. Only suspect a crash if a report appears in Xcode › Devices › View Device Logs |
-| `503 unavailable`, "No camera is available" | Running in the Simulator, or camera permission denied | Run on hardware; check Settings › Camera API |
+| `503 unavailable`, "No camera is available" | Running in the Simulator, or camera permission denied | Run on hardware; check Settings › AnyCamera |
 | `400`, "No format … supports 60 fps" | That camera cannot do that rate at that resolution | `camctl formats --min-fps 60` and pick a listed mode |
 | `session.interrupted` events | App backgrounded, camera taken by another app, or thermal pressure | See `interruptionReason`; check `thermalState` in `/status` |
 | Downloads stall part-way | Cable or `usbmuxd` hiccup | Re-run the download — `Range` support means it resumes rather than restarts |
@@ -283,7 +283,7 @@ The app sets `UIFileSharingEnabled`, so its Documents directory is mountable
 directly. Useful for bulk offload:
 
 ```bash
-ifuse --documents com.szcharlesji.cameraapi /mnt/iphone
+ifuse --documents GRAIL.AnyCamera /mnt/iphone
 ```
 
 ```bash

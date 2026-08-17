@@ -111,10 +111,10 @@ final class CaptureController: NSObject, @unchecked Sendable {
     private let mjpeg: MJPEGBroadcaster
     private let events: EventBroadcaster
     private let jpegEncoder = JPEGEncoder()
-    private let log = Logger(subsystem: "cameraapi", category: "capture")
+    private let log = Logger(subsystem: "anycamera", category: "capture")
 
-    private let sessionQueue = DispatchQueue(label: "cameraapi.session")
-    private let sampleQueue = DispatchQueue(label: "cameraapi.samples")
+    private let sessionQueue = DispatchQueue(label: "anycamera.session")
+    private let sampleQueue = DispatchQueue(label: "anycamera.samples")
 
     // MARK: - Session objects (sessionQueue)
 

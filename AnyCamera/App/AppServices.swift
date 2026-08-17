@@ -44,7 +44,7 @@ final class AppServices {
         let message: String
     }
 
-    private let log = Logger(subsystem: "cameraapi", category: "app")
+    private let log = Logger(subsystem: "anycamera", category: "app")
     private var refreshTimer: Timer?
     private var heartbeatTick = 0
 

@@ -7,7 +7,7 @@ import os
 final class RecordingStore: @unchecked Sendable {
     let directory: URL
 
-    private let log = Logger(subsystem: "cameraapi", category: "store")
+    private let log = Logger(subsystem: "anycamera", category: "store")
     private let lock = NSLock()
 
     private let encoder: JSONEncoder = {

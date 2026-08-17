@@ -18,7 +18,7 @@
           "name" : "Camera Body"
         }
       ],
-      "name" : "Camera API",
+      "name" : "AnyCamera",
       "shadow" : {
         "kind" : "neutral",
         "opacity" : 0.5

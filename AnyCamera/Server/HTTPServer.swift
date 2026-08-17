@@ -29,8 +29,8 @@ final class HTTPServer: @unchecked Sendable {
     }
 
     private let router: Router
-    private let log = Logger(subsystem: "cameraapi", category: "http")
-    private let queue = DispatchQueue(label: "cameraapi.server")
+    private let log = Logger(subsystem: "anycamera", category: "http")
+    private let queue = DispatchQueue(label: "anycamera.server")
     private let lock = NSLock()
 
     private var listener: NWListener?

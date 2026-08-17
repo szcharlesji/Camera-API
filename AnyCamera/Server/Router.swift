@@ -13,7 +13,7 @@ final class Router: @unchecked Sendable {
     private let store: RecordingStore
     private let mjpeg: MJPEGBroadcaster
     private let events: EventBroadcaster
-    private let log = Logger(subsystem: "cameraapi", category: "router")
+    private let log = Logger(subsystem: "anycamera", category: "router")
     private let startedAt = Date()
 
     private weak var server: HTTPServer?
@@ -54,7 +54,7 @@ final class Router: @unchecked Sendable {
 
         // `/health` stays reachable without a token so a supervisor can probe it.
         if method == "GET", route == "health" {
-            return .json(AcknowledgementDTO(ok: true, message: "CameraAPI \(ServerInfo.version)"))
+            return .json(AcknowledgementDTO(ok: true, message: "AnyCamera \(ServerInfo.version)"))
         }
 
         try server?.authorize(request)
@@ -385,7 +385,7 @@ final class Router: @unchecked Sendable {
 
         return StatusResponseDTO(
             api: APIInfoDTO(
-                name: "CameraAPI",
+                name: "AnyCamera",
                 version: ServerInfo.version,
                 uptimeSeconds: Date().timeIntervalSince(startedAt),
                 port: Int(serverConfig.port),
@@ -446,7 +446,7 @@ final class Router: @unchecked Sendable {
     // MARK: - Index
 
     private static let indexPage = """
-    CameraAPI \(ServerInfo.version)
+    AnyCamera \(ServerInfo.version)
 
     Control and record the iPhone camera over HTTP. Reach this server from Linux with:
         iproxy 8080:8080 &

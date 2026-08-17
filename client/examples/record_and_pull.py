@@ -12,13 +12,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from camera_api import CameraAPI  # noqa: E402
+from anycamera import AnyCamera  # noqa: E402
 
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 10.0
 
 
 def main() -> int:
-    cam = CameraAPI()
+    cam = AnyCamera()
 
     print("Waiting for the camera…")
     cam.wait_until_ready(timeout=30)

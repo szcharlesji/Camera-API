@@ -13,7 +13,7 @@ final class JPEGEncoder: @unchecked Sendable {
     init() {
         context = CIContext(options: [
             .cacheIntermediates: false,
-            .name: "cameraapi.jpeg",
+            .name: "anycamera.jpeg",
         ])
     }
 

@@ -60,8 +60,8 @@ _RESULT_NAMES = {
 }
 
 _CLIENT_INFO = {
-    "ClientVersionString": "camera-api-python",
-    "ProgName": "camera-api",
+    "ClientVersionString": "anycamera-python",
+    "ProgName": "anycamera",
     "kLibUSBMuxVersion": 3,
 }
 
@@ -261,7 +261,7 @@ def connect(
         if number == 3:
             raise ConnectionRefused(
                 f"Nothing is listening on port {port} inside the device. "
-                f"Is the CameraAPI app installed and in the foreground?"
+                f"Is the AnyCamera app installed and in the foreground?"
             )
         raise UsbmuxError(f"usbmux Connect to port {port} failed: {name}")
 
