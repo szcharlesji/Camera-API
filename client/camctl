@@ -420,13 +420,18 @@ def cmd_stream(cam, args):
             params.append(f"quality={args.quality}")
         if args.max_width:
             params.append(f"maxWidth={args.max_width}")
+        if args.crop:
+            params.append(f"crop={args.crop}")
         query = ("?" + "&".join(params)) if params else ""
         print(f"{cam.base_url}/stream.mjpeg{query}")
         return
 
     count = 0
     started = time.monotonic()
-    stream = cam.stream_mjpeg(fps=args.fps, quality=args.quality, max_width=args.max_width)
+    crop = None
+    if args.crop:
+        crop = () if args.crop == "none" else tuple(float(value) for value in args.crop.split(","))
+    stream = cam.stream_mjpeg(fps=args.fps, quality=args.quality, max_width=args.max_width, crop=crop)
     try:
         for jpeg in stream:
             if args.outdir:
@@ -640,6 +645,8 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--fps", type=float)
     stream.add_argument("--quality", type=float)
     stream.add_argument("--max-width", type=int)
+    stream.add_argument("--crop", metavar="X,Y,W,H",
+                        help="stream a region, normalised with a top-left origin; 'none' clears it")
     stream.set_defaults(func=cmd_stream)
 
     events = sub.add_parser("events", help="tail the server-sent event stream")

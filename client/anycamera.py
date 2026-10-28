@@ -488,8 +488,10 @@ class AnyCamera:
         fps: Optional[float] = None,
         quality: Optional[float] = None,
         max_width: Optional[int] = None,
+        crop: Optional[tuple] = None,
     ) -> dict:
-        body = {"fps": fps, "quality": quality, "maxWidth": max_width}
+        """``crop`` is ``(x, y, width, height)`` normalised with a top-left origin; ``()`` clears it."""
+        body = {"fps": fps, "quality": quality, "maxWidth": max_width, "crop": None if crop is None else list(crop)}
         return self._json("POST", "/stream/settings", body={k: v for k, v in body.items() if v is not None})
 
     # ------------------------------------------------------------------- recording
@@ -682,6 +684,7 @@ class AnyCamera:
         fps: Optional[float] = None,
         quality: Optional[float] = None,
         max_width: Optional[int] = None,
+        crop: Optional[tuple] = None,
         timeout: float = 30.0,
     ) -> Iterator[bytes]:
         """Yields JPEG frames from the live stream, forever.
@@ -690,9 +693,9 @@ class AnyCamera:
                 ...
 
         Each yielded value is a complete JPEG file. Break out of the loop to
-        disconnect.
+        disconnect. ``crop`` is as for ``stream_frames``.
         """
-        params = {"fps": fps, "quality": quality, "maxWidth": max_width}
+        params = {"fps": fps, "quality": quality, "maxWidth": max_width, "crop": _crop_param(crop)}
         response = self._open("GET", "/stream.mjpeg", params=params, timeout=timeout)
         try:
             for frame in _iter_multipart_jpeg(response):
@@ -716,9 +719,7 @@ class AnyCamera:
         ``crop`` is ``(x, y, width, height)`` normalised with a top-left origin; ``()``
         clears a crop set earlier. Timing fields are ``None`` on servers that predate them.
         """
-        params = {"fps": fps, "quality": quality, "maxWidth": max_width}
-        if crop is not None:
-            params["crop"] = ",".join(f"{value:.6f}" for value in crop) if crop else "none"
+        params = {"fps": fps, "quality": quality, "maxWidth": max_width, "crop": _crop_param(crop)}
         response = self._open("GET", "/stream.mjpeg", params=params, timeout=timeout)
         try:
             yield from _iter_multipart_jpeg(response)
@@ -849,12 +850,20 @@ def _read_line(stream) -> bytes:
             return bytes(line)
 
 
+def _crop_param(crop: Optional[tuple]) -> Optional[str]:
+    """``crop=x,y,w,h`` for the stream URL; ``()`` becomes ``none``, which clears it."""
+    if crop is None:
+        return None
+    return ",".join(f"{value:.6f}" for value in crop) if crop else "none"
+
+
 @dataclass
 class StreamFrame:
     """One MJPEG part. Times are seconds on the phone's capture clock (see ``/clock``)."""
 
     jpeg: bytes
-    #: Capture-output frame count; a jump of more than one means frames were not streamed.
+    #: Capture-output frame count, late frames the camera discarded included; a jump
+    #: of more than one means frames were not streamed.
     index: Optional[int] = None
     #: The frame's capture timestamp.
     pts: Optional[float] = None
