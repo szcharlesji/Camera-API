@@ -695,6 +695,32 @@ class AnyCamera:
         params = {"fps": fps, "quality": quality, "maxWidth": max_width}
         response = self._open("GET", "/stream.mjpeg", params=params, timeout=timeout)
         try:
+            for frame in _iter_multipart_jpeg(response):
+                yield frame.jpeg
+        finally:
+            response.close()
+
+    def stream_frames(
+        self,
+        fps: Optional[float] = None,
+        quality: Optional[float] = None,
+        max_width: Optional[int] = None,
+        crop: Optional[tuple] = None,
+        timeout: float = 30.0,
+    ) -> Iterator["StreamFrame"]:
+        """Like ``stream_mjpeg``, but yields ``StreamFrame``s with capture timing.
+
+            for frame in cam.stream_frames(fps=60, max_width=640, crop=(0.2, 0.2, 0.6, 0.6)):
+                frame.index, frame.pts, frame.jpeg
+
+        ``crop`` is ``(x, y, width, height)`` normalised with a top-left origin; ``()``
+        clears a crop set earlier. Timing fields are ``None`` on servers that predate them.
+        """
+        params = {"fps": fps, "quality": quality, "maxWidth": max_width}
+        if crop is not None:
+            params["crop"] = ",".join(f"{value:.6f}" for value in crop) if crop else "none"
+        response = self._open("GET", "/stream.mjpeg", params=params, timeout=timeout)
+        try:
             yield from _iter_multipart_jpeg(response)
         finally:
             response.close()
@@ -823,7 +849,20 @@ def _read_line(stream) -> bytes:
             return bytes(line)
 
 
-def _iter_multipart_jpeg(stream) -> Iterator[bytes]:
+@dataclass
+class StreamFrame:
+    """One MJPEG part. Times are seconds on the phone's capture clock (see ``/clock``)."""
+
+    jpeg: bytes
+    #: Capture-output frame count; a jump of more than one means frames were not streamed.
+    index: Optional[int] = None
+    #: The frame's capture timestamp.
+    pts: Optional[float] = None
+    #: When the encoded frame left the encoder; ``sent - pts`` is phone-side latency.
+    sent: Optional[float] = None
+
+
+def _iter_multipart_jpeg(stream) -> Iterator[StreamFrame]:
     """Parses ``multipart/x-mixed-replace`` into individual JPEG payloads."""
     while True:
         # Skip forward to the next part boundary.
@@ -834,13 +873,21 @@ def _iter_multipart_jpeg(stream) -> Iterator[bytes]:
             continue
 
         length = None
+        timing = {}
         while True:
             header = _read_line(stream)
             if not header or header == b"\r\n":
                 break
             name, _, value = header.decode("latin-1").partition(":")
-            if name.strip().lower() == "content-length":
+            name = name.strip().lower()
+            if name == "content-length":
                 length = int(value.strip())
+            elif name == "x-frame-index":
+                timing["index"] = int(value.strip())
+            elif name == "x-frame-pts":
+                timing["pts"] = float(value.strip())
+            elif name == "x-frame-sent":
+                timing["sent"] = float(value.strip())
 
         if length is None:
             # Without a length there is no safe way to find the payload end.
@@ -853,7 +900,7 @@ def _iter_multipart_jpeg(stream) -> Iterator[bytes]:
                 return
             payload += chunk
 
-        yield bytes(payload)
+        yield StreamFrame(jpeg=bytes(payload), **timing)
 
 
 def _iter_sse(stream) -> Iterator[tuple]:

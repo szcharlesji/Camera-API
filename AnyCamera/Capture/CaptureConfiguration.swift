@@ -137,11 +137,20 @@ struct StreamSettings: Sendable, Equatable {
     var fps: Double = 15
     var quality: Double = 0.6
     var maxWidth: Int = 640
+    /// Region of the frame to stream, normalised to 0...1 with a top-left origin,
+    /// applied before `maxWidth`. `nil` streams the whole frame.
+    var crop: CGRect?
 
     mutating func clamp() {
         fps = min(max(fps, 1), 60)
         quality = min(max(quality, 0.1), 1.0)
         maxWidth = min(max(maxWidth, 64), 3840)
+        if let region = crop?.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)),
+           region.width >= 0.01, region.height >= 0.01 {
+            crop = region
+        } else {
+            crop = nil
+        }
     }
 }
 

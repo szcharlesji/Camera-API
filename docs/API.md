@@ -130,7 +130,7 @@ poll.
     "torchLevel": 0
   },
   "recording": null,
-  "stream": { "fps": 15, "quality": 0.6, "maxWidth": 640, "clients": 0 },
+  "stream": { "fps": 15, "quality": 0.6, "maxWidth": 640, "crop": null, "clients": 0, "encoderBusyDrops": 0 },
   "storage": { "recordingCount": 3, "totalBytes": 48211004, "freeDiskBytes": 84129382400 }
 }
 ```
@@ -419,10 +419,13 @@ deterministic.
 Adjusts the MJPEG preview without touching what gets recorded.
 
 ```json
-{ "fps": 15, "quality": 0.6, "maxWidth": 640 }
+{ "fps": 15, "quality": 0.6, "maxWidth": 640, "crop": [0.23, 0.25, 0.61, 0.61] }
 ```
 
 `fps` 1–60, `quality` 0.1–1.0, `maxWidth` 64–3840 (applied to the longest edge).
+`crop` is `[x, y, width, height]` in 0–1 with a top-left origin, taken from the
+frame before `maxWidth` scales it, so pixels outside a region of interest cost
+nothing to encode or send; `[]` clears it.
 
 ### `POST /server/settings`
 
@@ -646,17 +649,33 @@ frame arrives within `timeout`.
 ```
 --anycameraframe
 Content-Type: image/jpeg
+X-Frame-Index: 18234
+X-Frame-PTS: 51234.016667
+X-Frame-Sent: 51234.023104
 Content-Length: 24196
 
 <JPEG bytes>
 ```
 
-`fps`, `quality` and `maxWidth` query parameters update the shared stream settings,
-so quality is tunable from the URL alone:
+| Header | Meaning |
+|---|---|
+| `X-Frame-Index` | Video frames the capture output has delivered. Consecutive parts differ by one when every frame is streamed; a larger step is a frame that was not. |
+| `X-Frame-PTS` | The frame's capture timestamp, seconds on the capture clock that `GET /clock` reports. With `camctl sync`'s offset this maps to host time. |
+| `X-Frame-Sent` | The same clock when the encoded frame was handed to the connections. `Sent − PTS` is the phone-side latency. |
+
+`fps`, `quality`, `maxWidth` and `crop` (`crop=x,y,w,h`, or `crop=none`) query
+parameters update the shared stream settings, so the stream is tunable from the URL
+alone:
 
 ```bash
 ffplay 'http://localhost:8080/stream.mjpeg?fps=30&quality=0.7&maxWidth=960'
 ```
+
+Frames are paced on their capture timestamps, so `fps` equal to the capture rate
+streams every frame. JPEG encoding runs on its own queue: when it cannot keep up,
+the frame is skipped and counted in `stream.encoderBusyDrops`, and the recorder
+is not affected. Lower `maxWidth`, or `crop` to the region you need, until that
+counter stays still.
 
 A client that reads more slowly than frames are produced has its excess frames
 **dropped**, never queued — a stalled viewer cannot grow memory on the phone or

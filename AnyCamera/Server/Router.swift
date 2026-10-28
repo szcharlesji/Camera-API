@@ -123,7 +123,7 @@ final class Router: @unchecked Sendable {
             return try snapshot(request)
 
         case ("GET", "stream.mjpeg"), ("GET", "stream"):
-            return streamMJPEG(request)
+            return try streamMJPEG(request)
 
         case ("POST", "stream/settings"):
             let body = try request.decodeBody(StreamSettingsRequest.self)
@@ -131,6 +131,7 @@ final class Router: @unchecked Sendable {
             if let fps = body.fps { settings.fps = fps }
             if let quality = body.quality { settings.quality = quality }
             if let maxWidth = body.maxWidth { settings.maxWidth = maxWidth }
+            if let crop = body.crop { settings.crop = try Self.streamCrop(crop) }
             capture().streamSettings = settings
             return .json(streamState())
 
@@ -290,13 +291,24 @@ final class Router: @unchecked Sendable {
         )
     }
 
-    private func streamMJPEG(_ request: HTTPRequest) -> HTTPResponse {
+    private func streamMJPEG(_ request: HTTPRequest) throws -> HTTPResponse {
         // Query parameters adjust the shared stream settings so a client can dial
         // in quality with nothing but a URL.
         var settings = capture().streamSettings
         if let fps = request.queryDouble("fps") { settings.fps = fps }
         if let quality = request.queryDouble("quality") { settings.quality = quality }
         if let maxWidth = request.queryInt("maxWidth") { settings.maxWidth = maxWidth }
+        if let crop = request.queryString("crop") {
+            // `crop=x,y,w,h`; `crop=` or `crop=none` clears it.
+            let parts = crop == "none" ? [] : crop.split(separator: ",")
+            let values = try parts.map { part -> Double in
+                guard let value = Double(part.trimmingCharacters(in: .whitespaces)) else {
+                    throw APIError.badRequest("crop must be four numbers x,y,w,h; got '\(crop)'.")
+                }
+                return value
+            }
+            settings.crop = try Self.streamCrop(values)
+        }
         capture().streamSettings = settings
 
         let broadcaster = mjpeg
@@ -414,8 +426,23 @@ final class Router: @unchecked Sendable {
             fps: settings.fps,
             quality: settings.quality,
             maxWidth: settings.maxWidth,
-            clients: mjpeg.subscriberCount
+            crop: settings.crop.map { [$0.minX, $0.minY, $0.width, $0.height] },
+            clients: mjpeg.subscriberCount,
+            encoderBusyDrops: capture().streamEncoderBusyDrops
         )
+    }
+
+    /// `[]` clears the crop; otherwise four values inside the unit square.
+    private static func streamCrop(_ values: [Double]) throws -> CGRect? {
+        if values.isEmpty { return nil }
+        guard values.count == 4 else {
+            throw APIError.badRequest("crop must be [x, y, width, height] or []; got \(values.count) values.")
+        }
+        let (x, y, width, height) = (values[0], values[1], values[2], values[3])
+        guard x >= 0, y >= 0, width >= 0.01, height >= 0.01, x + width <= 1, y + height <= 1 else {
+            throw APIError.badRequest("crop must lie inside the frame, normalised to 0...1 with a top-left origin.")
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 
     private func deviceInfo() -> DeviceInfoDTO {

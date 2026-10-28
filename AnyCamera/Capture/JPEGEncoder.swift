@@ -21,10 +21,26 @@ final class JPEGEncoder: @unchecked Sendable {
     ///   - maxWidth: frames wider than this are scaled down to fit; taller-than-wide
     ///     frames are measured on their longest edge so a rotated stream stays bounded.
     ///   - quality: 0.0...1.0
-    func encode(pixelBuffer: CVPixelBuffer, maxWidth: Int, quality: Double) -> Data? {
+    ///   - crop: region to keep, normalised to 0...1 with a top-left origin; applied
+    ///     before scaling, so `maxWidth` bounds the cropped region.
+    func encode(pixelBuffer: CVPixelBuffer, maxWidth: Int, quality: Double, crop: CGRect? = nil) -> Data? {
         var image = CIImage(cvPixelBuffer: pixelBuffer)
-        let extent = image.extent
+        var extent = image.extent
         guard extent.width > 0, extent.height > 0 else { return nil }
+
+        if let crop {
+            // Core Image's origin is bottom-left; the API's is top-left.
+            let region = CGRect(
+                x: extent.minX + crop.minX * extent.width,
+                y: extent.minY + (1 - crop.maxY) * extent.height,
+                width: crop.width * extent.width,
+                height: crop.height * extent.height
+            ).integral.intersection(extent)
+            guard region.width > 0, region.height > 0 else { return nil }
+            image = image.cropped(to: region)
+                .transformed(by: CGAffineTransform(translationX: -region.minX, y: -region.minY))
+            extent = image.extent
+        }
 
         let longestEdge = max(extent.width, extent.height)
         if longestEdge > CGFloat(maxWidth) {

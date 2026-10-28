@@ -108,10 +108,20 @@ final class MJPEGBroadcaster: StreamBroadcaster, @unchecked Sendable {
         "multipart/x-mixed-replace; boundary=\(boundary)"
     }
 
-    func send(jpeg: Data) {
+    /// - Parameters:
+    ///   - frameIndex: count of video frames the capture output has delivered, so a
+    ///     client sees every capture frame it did not receive as a gap.
+    ///   - presentationSeconds: the frame's capture timestamp, on the clock `/clock`
+    ///     reports as `captureClockSeconds`.
+    ///   - sentSeconds: the same clock when the encoded frame was handed to the
+    ///     connections; `sentSeconds - presentationSeconds` is the phone-side latency.
+    func send(jpeg: Data, frameIndex: UInt64, presentationSeconds: Double, sentSeconds: Double) {
         var part = Data()
         part.append(Data("--\(Self.boundary)\r\n".utf8))
         part.append(Data("Content-Type: image/jpeg\r\n".utf8))
+        part.append(Data("X-Frame-Index: \(frameIndex)\r\n".utf8))
+        part.append(Data(String(format: "X-Frame-PTS: %.6f\r\n", presentationSeconds).utf8))
+        part.append(Data(String(format: "X-Frame-Sent: %.6f\r\n", sentSeconds).utf8))
         part.append(Data("Content-Length: \(jpeg.count)\r\n\r\n".utf8))
         part.append(jpeg)
         part.append(Data("\r\n".utf8))

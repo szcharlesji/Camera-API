@@ -115,6 +115,8 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
     private let sessionQueue = DispatchQueue(label: "anycamera.session")
     private let sampleQueue = DispatchQueue(label: "anycamera.samples")
+    /// Encodes stream frames, one at a time, so JPEG work never blocks `sampleQueue`.
+    private let streamQueue = DispatchQueue(label: "anycamera.stream", qos: .userInteractive)
 
     // MARK: - Session objects (sessionQueue)
 
@@ -129,8 +131,17 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
     private var activeRecording: ActiveRecording?
     private var pendingSnapshots: [SnapshotRequest] = []
-    private var lastStreamedFrameTime: CFTimeInterval = 0
+    /// Capture timestamp, in seconds, at which the next stream frame is due.
+    private var nextStreamDue: Double = -.infinity
+    /// Video frames delivered by the capture output, streamed or not.
+    private var videoFrameIndex: UInt64 = 0
     private var lastProgressPublish: CFTimeInterval = 0
+
+    // MARK: - Stream encoder (streamLock)
+
+    private let streamLock = NSLock()
+    private var streamEncoding = false
+    private var _streamEncoderBusyDrops = 0
 
     // MARK: - Shared state (stateLock)
 
@@ -176,6 +187,11 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
     var isRecording: Bool {
         stateLock.withLock { _progress != nil }
+    }
+
+    /// Stream frames skipped because the previous one was still being encoded.
+    var streamEncoderBusyDrops: Int {
+        streamLock.withLock { _streamEncoderBusyDrops }
     }
 
     var recordingProgress: ActiveRecordingDTO? {
@@ -1337,9 +1353,10 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
             }
         }
 
+        videoFrameIndex += 1
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         servicePendingSnapshots(pixelBuffer)
-        serviceStream(pixelBuffer)
+        serviceStream(pixelBuffer, presentationTime: presentationTime)
     }
 
     private func appendVideo(_ sampleBuffer: CMSampleBuffer, presentationTime: CMTime, to recording: ActiveRecording) {
@@ -1460,22 +1477,50 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         }
     }
 
-    private func serviceStream(_ pixelBuffer: CVPixelBuffer) {
-        guard mjpeg.hasSubscribers else { return }
+    private func serviceStream(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        guard mjpeg.hasSubscribers, presentationTime.isValid else { return }
 
         let settings = streamSettings
-        let now = CACurrentMediaTime()
+        let pts = CMTimeGetSeconds(presentationTime)
         let interval = 1.0 / settings.fps
-        guard now - lastStreamedFrameTime >= interval else { return }
-        lastStreamedFrameTime = now
+        // Pace on the capture timestamp, and accept a frame up to a quarter interval
+        // early. Comparing arrival times against exactly 1/fps skipped every frame
+        // that arrived slightly early, so 60 fps on a 60 fps capture streamed ~40 fps
+        // with 33 ms holes.
+        guard pts >= nextStreamDue - interval / 4 else { return }
+        // Keep the cadence anchored, but restart it after a gap instead of bursting.
+        nextStreamDue = (pts - nextStreamDue > interval / 2 ? pts : nextStreamDue) + interval
 
-        guard let jpeg = jpegEncoder.encode(
-            pixelBuffer: pixelBuffer,
-            maxWidth: settings.maxWidth,
-            quality: settings.quality
-        ) else { return }
+        let accepted: Bool = streamLock.withLock {
+            guard !streamEncoding else {
+                _streamEncoderBusyDrops += 1
+                return false
+            }
+            streamEncoding = true
+            return true
+        }
+        guard accepted else { return }
 
-        mjpeg.send(jpeg: jpeg)
+        // Encode off `sampleQueue`. Inline, a 720p JPEG took long enough that the
+        // capture output discarded the next frame, which starved the recorder too.
+        let frameIndex = videoFrameIndex
+        streamQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.streamLock.withLock { self.streamEncoding = false } }
+            guard let jpeg = self.jpegEncoder.encode(
+                pixelBuffer: pixelBuffer,
+                maxWidth: settings.maxWidth,
+                quality: settings.quality,
+                crop: settings.crop
+            ) else { return }
+
+            self.mjpeg.send(
+                jpeg: jpeg,
+                frameIndex: frameIndex,
+                presentationSeconds: pts,
+                sentSeconds: self.captureClockSeconds()
+            )
+        }
     }
 }
 

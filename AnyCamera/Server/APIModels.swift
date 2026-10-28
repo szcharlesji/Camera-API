@@ -91,6 +91,8 @@ struct StreamSettingsRequest: Decodable {
     var quality: Double?
     /// Longest edge of streamed frames; frames are downscaled to fit.
     var maxWidth: Int?
+    /// `[x, y, width, height]`, normalised with a top-left origin; `[]` clears it.
+    var crop: [Double]?
 }
 
 struct ServerSettingsRequest: Decodable {
@@ -299,7 +301,11 @@ struct StreamStateDTO: Encodable {
     let fps: Double
     let quality: Double
     let maxWidth: Int
+    /// `[x, y, width, height]`, normalised with a top-left origin.
+    @Nullable var crop: [Double]?
     let clients: Int
+    /// Frames skipped because the previous one was still being encoded.
+    let encoderBusyDrops: Int
 }
 
 struct StorageDTO: Encodable {
