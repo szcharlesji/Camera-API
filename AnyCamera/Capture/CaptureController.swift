@@ -1028,23 +1028,34 @@ final class CaptureController: NSObject, @unchecked Sendable {
             guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else {
                 throw APIError.badRequest("This camera does not support manual white balance gains.")
             }
-            let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+            let current = device.temperatureAndTintValues(for: Self.clamped(device.deviceWhiteBalanceGains, for: device))
             let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
                 temperature: whiteBalance.temperature ?? current.temperature,
                 tint: whiteBalance.tint ?? current.tint
             )
-            var gains = device.deviceWhiteBalanceGains(for: values)
             // Out-of-gamut temperature/tint pairs produce gains the hardware rejects.
-            let maxGain = device.maxWhiteBalanceGain
-            gains.redGain = min(max(gains.redGain, 1.0), maxGain)
-            gains.greenGain = min(max(gains.greenGain, 1.0), maxGain)
-            gains.blueGain = min(max(gains.blueGain, 1.0), maxGain)
+            let gains = Self.clamped(device.deviceWhiteBalanceGains(for: values), for: device)
             let semaphore = DispatchSemaphore(value: 0)
             device.setWhiteBalanceModeLocked(with: gains) { _ in semaphore.signal() }
             pending.append(.handler(label: "white balance gains", semaphore: semaphore))
         default:
             throw APIError.badRequest("Unknown whiteBalance.mode '\(mode)'. Expected 'auto', 'single', 'locked' or 'manual'.")
         }
+    }
+
+    /// Clamps gains to `1...maxWhiteBalanceGain`. Converting gains outside that range
+    /// raises an Objective-C exception, and the camera reports such gains itself just
+    /// after the session starts, before auto white balance has converged.
+    private static func clamped(
+        _ gains: AVCaptureDevice.WhiteBalanceGains,
+        for device: AVCaptureDevice
+    ) -> AVCaptureDevice.WhiteBalanceGains {
+        let maxGain = device.maxWhiteBalanceGain
+        var gains = gains
+        gains.redGain = min(max(gains.redGain, 1.0), maxGain)
+        gains.greenGain = min(max(gains.greenGain, 1.0), maxGain)
+        gains.blueGain = min(max(gains.blueGain, 1.0), maxGain)
+        return gains
     }
 
     private func applyTorch(_ torch: ControlRequest.Torch, to device: AVCaptureDevice) throws {
@@ -1078,7 +1089,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
                 zoom: 1, torchOn: false, torchLevel: 0
             )
         }
-        let temperatureAndTint = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+        let temperatureAndTint = device.temperatureAndTintValues(for: Self.clamped(device.deviceWhiteBalanceGains, for: device))
         return ControlStateDTO(
             focusMode: Self.name(for: device.focusMode),
             lensPosition: device.lensPosition,
