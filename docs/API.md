@@ -659,7 +659,7 @@ Content-Length: 24196
 
 | Header | Meaning |
 |---|---|
-| `X-Frame-Index` | Video frames the capture output has delivered. Consecutive parts differ by one when every frame is streamed; a larger step is a frame that was not. |
+| `X-Frame-Index` | Video frames the capture output has produced, including late frames it discarded. Consecutive parts differ by one when every frame is streamed; a larger step is a frame that was not. |
 | `X-Frame-PTS` | The frame's capture timestamp, seconds on the capture clock that `GET /clock` reports. With `camctl sync`'s offset this maps to host time. |
 | `X-Frame-Sent` | The same clock when the encoded frame was handed to the connections. `Sent − PTS` is the phone-side latency. |
 
@@ -672,10 +672,14 @@ ffplay 'http://localhost:8080/stream.mjpeg?fps=30&quality=0.7&maxWidth=960'
 ```
 
 Frames are paced on their capture timestamps, so `fps` equal to the capture rate
-streams every frame. JPEG encoding runs on its own queue: when it cannot keep up,
-the frame is skipped and counted in `stream.encoderBusyDrops`, and the recorder
-is not affected. Lower `maxWidth`, or `crop` to the region you need, until that
-counter stays still.
+streams every frame. JPEG encoding runs off the capture queue, so the recorder is
+not affected, with up to five frames encoding at once and sent in capture order;
+a frame due while five are in flight is skipped and counted in
+`stream.encoderBusyDrops`. While recording, each encode waits about 45 ms whatever
+the frame size, against 8 ms otherwise, so a smaller `maxWidth` does not raise the
+rate. Measured on an iPhone 13 Pro at 720p60, the stream holds 60 fps either way,
+but phone-side latency (`X-Frame-Sent − X-Frame-PTS`) rises from about 37 ms to
+60–75 ms, with a p95 near 100 ms, while recording.
 
 A client that reads more slowly than frames are produced has its excess frames
 **dropped**, never queued — a stalled viewer cannot grow memory on the phone or

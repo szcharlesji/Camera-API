@@ -104,6 +104,20 @@ final class CaptureController: NSObject, @unchecked Sendable {
         }
     }
 
+    /// A stream frame accepted for encoding, held in `streamPipeline` until it can
+    /// be sent in capture order.
+    private final class StreamFrame {
+        let index: UInt64
+        let presentationSeconds: Double
+        var finished = false
+        var jpeg: Data?
+
+        init(index: UInt64, presentationSeconds: Double) {
+            self.index = index
+            self.presentationSeconds = presentationSeconds
+        }
+    }
+
     // MARK: - Collaborators
 
     let session = AVCaptureSession()
@@ -115,8 +129,12 @@ final class CaptureController: NSObject, @unchecked Sendable {
 
     private let sessionQueue = DispatchQueue(label: "anycamera.session")
     private let sampleQueue = DispatchQueue(label: "anycamera.samples")
-    /// Encodes stream frames, one at a time, so JPEG work never blocks `sampleQueue`.
-    private let streamQueue = DispatchQueue(label: "anycamera.stream", qos: .userInteractive)
+    /// Encodes stream frames, several at once, so JPEG work never blocks `sampleQueue`.
+    private let streamEncodeQueue = DispatchQueue(
+        label: "anycamera.stream.encode", qos: .userInteractive, attributes: .concurrent
+    )
+    /// Hands encoded stream frames to the broadcaster, one at a time, in capture order.
+    private let streamSendQueue = DispatchQueue(label: "anycamera.stream.send", qos: .userInteractive)
 
     // MARK: - Session objects (sessionQueue)
 
@@ -133,14 +151,22 @@ final class CaptureController: NSObject, @unchecked Sendable {
     private var pendingSnapshots: [SnapshotRequest] = []
     /// Capture timestamp, in seconds, at which the next stream frame is due.
     private var nextStreamDue: Double = -.infinity
-    /// Video frames delivered by the capture output, streamed or not.
+    /// Video frames the capture output has produced, streamed or not, including
+    /// late frames it discarded.
     private var videoFrameIndex: UInt64 = 0
     private var lastProgressPublish: CFTimeInterval = 0
 
     // MARK: - Stream encoder (streamLock)
 
+    /// While recording, a JPEG encode waits about 45 ms (p95 70 ms) whatever its
+    /// size, against 8 ms otherwise, so one encode at a time streamed 17 fps. Five in
+    /// flight measured 60 fps at 720p60 while recording. Each holds its capture
+    /// buffer until it finishes.
+    private static let maxStreamEncodes = 5
+
     private let streamLock = NSLock()
-    private var streamEncoding = false
+    /// Frames being encoded or waiting for an earlier one, oldest first.
+    private var streamPipeline: [StreamFrame] = []
     private var _streamEncoderBusyDrops = 0
 
     // MARK: - Shared state (stateLock)
@@ -189,7 +215,7 @@ final class CaptureController: NSObject, @unchecked Sendable {
         stateLock.withLock { _progress != nil }
     }
 
-    /// Stream frames skipped because the previous one was still being encoded.
+    /// Stream frames skipped because `maxStreamEncodes` were already in flight.
     var streamEncoderBusyDrops: Int {
         streamLock.withLock { _streamEncoderBusyDrops }
     }
@@ -1350,7 +1376,10 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         didDrop sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        guard output === videoOutput, let recording = activeRecording else { return }
+        guard output === videoOutput else { return }
+        // Counted so the stream's X-Frame-Index shows these as gaps too.
+        videoFrameIndex += 1
+        guard let recording = activeRecording else { return }
         recording.captureDrops += 1
     }
 
@@ -1499,37 +1528,55 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCap
         // that arrived slightly early, so 60 fps on a 60 fps capture streamed ~40 fps
         // with 33 ms holes.
         guard pts >= nextStreamDue - interval / 4 else { return }
-        // Keep the cadence anchored, but restart it after a gap instead of bursting.
-        nextStreamDue = (pts - nextStreamDue > interval / 2 ? pts : nextStreamDue) + interval
 
+        let frame = StreamFrame(index: videoFrameIndex, presentationSeconds: pts)
         let accepted: Bool = streamLock.withLock {
-            guard !streamEncoding else {
+            guard streamPipeline.count < Self.maxStreamEncodes else {
                 _streamEncoderBusyDrops += 1
                 return false
             }
-            streamEncoding = true
+            streamPipeline.append(frame)
             return true
         }
+        // A skipped frame leaves the cadence alone, so the next capture frame takes
+        // its place instead of waiting a whole stream interval.
         guard accepted else { return }
+        // Keep the cadence anchored, but restart it after a gap instead of bursting.
+        nextStreamDue = (pts - nextStreamDue > interval / 2 ? pts : nextStreamDue) + interval
 
         // Encode off `sampleQueue`. Inline, a 720p JPEG took long enough that the
         // capture output discarded the next frame, which starved the recorder too.
-        let frameIndex = videoFrameIndex
-        streamQueue.async { [weak self] in
+        streamEncodeQueue.async { [weak self] in
             guard let self else { return }
-            defer { self.streamLock.withLock { self.streamEncoding = false } }
-            guard let jpeg = self.jpegEncoder.encode(
+            let jpeg = self.jpegEncoder.encode(
                 pixelBuffer: pixelBuffer,
                 maxWidth: settings.maxWidth,
                 quality: settings.quality,
                 crop: settings.crop
-            ) else { return }
+            )
+            self.streamLock.withLock {
+                frame.jpeg = jpeg
+                frame.finished = true
+                // Encodes finish out of order. Release the finished frames at the head
+                // of the pipeline, and queue them under the lock so batches stay in order.
+                var ready: [StreamFrame] = []
+                while let head = self.streamPipeline.first, head.finished {
+                    ready.append(self.streamPipeline.removeFirst())
+                }
+                guard !ready.isEmpty else { return }
+                self.streamSendQueue.async { self.sendStreamFrames(ready) }
+            }
+        }
+    }
 
-            self.mjpeg.send(
+    private func sendStreamFrames(_ frames: [StreamFrame]) {
+        for frame in frames {
+            guard let jpeg = frame.jpeg else { continue }
+            mjpeg.send(
                 jpeg: jpeg,
-                frameIndex: frameIndex,
-                presentationSeconds: pts,
-                sentSeconds: self.captureClockSeconds()
+                frameIndex: frame.index,
+                presentationSeconds: frame.presentationSeconds,
+                sentSeconds: captureClockSeconds()
             )
         }
     }

@@ -145,7 +145,9 @@ struct StreamSettings: Sendable, Equatable {
         fps = min(max(fps, 1), 60)
         quality = min(max(quality, 0.1), 1.0)
         maxWidth = min(max(maxWidth, 64), 3840)
-        if let region = crop?.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)),
+        // Intersecting a crop already inside the frame would only add rounding noise.
+        let frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        if let region = crop.map({ frame.contains($0) ? $0 : $0.intersection(frame) }),
            region.width >= 0.01, region.height >= 0.01 {
             crop = region
         } else {
